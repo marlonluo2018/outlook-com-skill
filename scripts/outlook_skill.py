@@ -591,16 +591,12 @@ def cmd_compose(args):
 def cmd_batch_forward(args):
     """Batch forward email to multiple recipients by email ID"""
     try:
-        # Load configuration
-        import json
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.json')
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                batch_size = config.get('batch_forward', {}).get('batch_size', 500)
-        except (FileNotFoundError, json.JSONDecodeError):
-            # Fallback to default if config file not found or invalid
-            batch_size = 500
+        # Import batch configuration from backend/config.py
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+        from backend.config import batch_config
+        
+        # Use configured batch size from backend/config.py
+        batch_size = batch_config.OUTLOOK_BCC_LIMIT
         
         with OutlookSessionManager() as session:
             email_item = session.outlook.GetNamespace("MAPI").GetItemFromID(args.email_id)

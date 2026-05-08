@@ -1,6 +1,0 @@
-{
-  "batch_forward": {
-    "batch_size": 500,
-    "description": "Number of recipients per batch when forwarding emails. Recommended: 500. Lower values for testing, higher values may hit Exchange limits."
-  }
-}

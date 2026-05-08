@@ -57,18 +57,17 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 - Uses BCC for privacy
 - Preserves original email formatting
 - Automatically splits large recipient lists into batches
-- **Batch size:** Configured in [`config.json`](config.json) (default: 500)
+- **Batch size:** Configured in [`backend/config.py`](backend/config.py) (default: 500)
 
 ## Configuration
 
-Edit [`config.json`](config.json) to customize settings:
+All configuration is centralized in [`backend/config.py`](backend/config.py).
 
-```json
-{
-  "batch_forward": {
-    "batch_size": 500
-  }
-}
+**To change batch size:**
+Edit `backend/config.py` and modify:
+```python
+class BatchConfig:
+    OUTLOOK_BCC_LIMIT = 500  # Change this value
 ```
 
 **Batch size recommendations:**
