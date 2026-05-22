@@ -655,6 +655,46 @@ def cmd_forward(args):
         return 1
 
 
+def cmd_redirect(args):
+    """Redirect an email: clear all recipients, add new TO/CC, preserve original body."""
+    try:
+        with OutlookSessionManager() as session:
+            email_item = _get_email_item(session, args.email_id)
+            forward = email_item.Forward()
+
+            # Remove all pre-populated recipients
+            while forward.Recipients.Count > 0:
+                forward.Recipients.Remove(1)
+
+            # Add new recipients
+            _add_recipients(forward, args.to, args.cc)
+
+            if forward.Recipients.Count == 0:
+                print("Error: No recipients specified. Use --to or --cc.")
+                return 1
+
+            # Subject
+            original_subject = str(getattr(email_item, "Subject", "No Subject"))
+            forward.Subject = f"FW: {original_subject}" if not original_subject.startswith("FW:") else original_subject
+
+            # Signature + body
+            forward.Display(False)
+            signature_html = forward.HTMLBody
+            forward.HTMLBody = args.body + signature_html
+
+            recipient_count = forward.Recipients.Count
+            final_subject = forward.Subject
+
+            _add_attachments(forward, args.attach)
+            forward.Send()
+            print(f"Redirected to {recipient_count} recipient(s)")
+            print(f"Subject: {final_subject}")
+            return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
 def cmd_create_folder(args):
     """Create a new folder"""
     try:
@@ -926,6 +966,15 @@ def main():
     parser_forward.add_argument('--body', help='Custom message to prepend')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_forward.set_defaults(func=cmd_forward)
+
+    # Redirect command (clear all recipients, add new ones)
+    parser_redirect = subparsers.add_parser('redirect', help='Redirect email: clear all recipients, set new TO/CC')
+    parser_redirect.add_argument('email_id', help='Email ID from search results')
+    parser_redirect.add_argument('body', help='Message body in HTML format')
+    parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
+    parser_redirect.add_argument('--cc', help='CC recipients (comma separated)')
+    parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_redirect.set_defaults(func=cmd_redirect)
 
     # Batch forward command
     parser_batch = subparsers.add_parser('batch-forward', help='Batch forward email by ID to multiple recipients')

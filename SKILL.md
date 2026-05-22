@@ -8,13 +8,13 @@ triggers: [
   "find thread", "find conversation",
   "find related",
   "draft email", "compose", "write email", "new email",
-  "reply", "forward", "send to",
+  "reply", "forward", "redirect", "send to",
   "batch forward", "mass forward", "forward to multiple",
   "get email", "view email", "show email details",
   "download attachment", "save attachment", "get attachment",
   "lookup contact", "who is"
 ]
-operations: ["find-recent", "find", "compose", "reply", "forward", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email"]
+operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email"]
 ---
 
 # Outlook Skill
@@ -142,6 +142,19 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 - Preserves original email formatting
 - Automatically splits large recipient lists into batches
 - **Batch size:** Configured in [`backend/config.py`](backend/config.py) (default: 500)
+
+### Redirect (Clear Recipients + New TO/CC)
+```bash
+py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>New message body</p>" --to "a@b.com,c@d.com"
+py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>FYI</p>" --to "a@b.com" --cc "b@b.com"
+```
+- Clears all existing TO and CC recipients, then adds new ones
+- Preserves original email body as quoted content (like forward)
+- `body` (required): HTML message prepended above original content
+- `--to` (required): New TO recipients (comma separated)
+- `--cc`: New CC recipients (comma separated)
+- `--attach`: File path(s) to attach (comma separated)
+- Use when you want to send the same email to entirely different people
 
 ### Download Attachment
 ```bash
