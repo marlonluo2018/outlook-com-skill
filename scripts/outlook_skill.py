@@ -30,7 +30,7 @@ from backend.email_search import (
     unified_search,
 )
 from backend.email_composition import compose_email
-from backend.outlook_session.contact_operations import get_contact_by_email, get_display_name_from_email
+from backend.outlook_session.contact_operations import get_contact_by_email, get_contact_by_name, get_display_name_from_email
 from backend.config import search_config, display_config
 
 
@@ -432,9 +432,11 @@ def cmd_replyall(args):
                             cc_recip = reply.Recipients.Add(r)
                             cc_recip.Type = 2
                 _add_recipients(reply, args.to, args.cc)
+                reply.Display(False)
+                signature_html = reply.HTMLBody
                 separator = '<hr style="border: 1px solid #ccc; margin: 20px 0;">'
                 original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
-                reply.HTMLBody = args.body + separator + original_body
+                reply.HTMLBody = args.body + signature_html + separator + original_body
             else:
                 # Inbox: ReplyAll + append
                 reply = email_item.ReplyAll()
@@ -475,9 +477,11 @@ def cmd_reply(args):
                 # Sent Items: new email with only specified recipients
                 reply = session.outlook.CreateItem(0)
                 _add_recipients(reply, args.to, args.cc)
+                reply.Display(False)
+                signature_html = reply.HTMLBody
                 separator = '<hr style="border: 1px solid #ccc; margin: 20px 0;">'
                 original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
-                reply.HTMLBody = args.body + separator + original_body
+                reply.HTMLBody = args.body + signature_html + separator + original_body
             else:
                 # Inbox: Reply (sender only) + specified extras
                 reply = email_item.Reply()
@@ -713,28 +717,39 @@ def cmd_delete_email(args):
 
 
 def cmd_lookup_contact(args):
-    """Look up contact information by email address"""
+    """Look up contact information by email address or display name"""
     try:
-        contact_info = get_contact_by_email(args.email)
-        
-        if contact_info:
-            print("\nContact Information:")
-            print(f"Display Name: {contact_info['display_name']}")
-            print(f"Email: {contact_info['email']}")
-            if contact_info.get('first_name'):
-                print(f"First Name: {contact_info['first_name']}")
-            if contact_info.get('last_name'):
-                print(f"Last Name: {contact_info['last_name']}")
-            if contact_info.get('company'):
-                print(f"Company: {contact_info['company']}")
-            if contact_info.get('job_title'):
-                print(f"Job Title: {contact_info['job_title']}")
+        query = args.query
+        if '@' in query:
+            contact_info = get_contact_by_email(query)
+            results = [contact_info] if contact_info else []
         else:
-            print(f"No contact found for: {args.email}")
-            print("\nTip: Try searching by partial email username instead:")
-            username = args.email.split('@')[0] if '@' in args.email else args.email
-            print(f"  py outlook_skill.py search --type sender --query \"{username}\"")
-        
+            results = get_contact_by_name(query)
+
+        if not results:
+            print(f"No contact found for: {query}")
+            return 0
+
+        print(f"\n{'='*50}")
+        print(f" Contact Results ({len(results)} match{'es' if len(results) > 1 else ''})")
+        print(f"{'='*50}")
+
+        for i, contact in enumerate(results, 1):
+            if len(results) > 1:
+                print(f"\n--- [{i}] ---")
+            else:
+                print()
+            print(f"Display Name: {contact['display_name']}")
+            print(f"Email: {contact['email']}")
+            if contact.get('first_name'):
+                print(f"First Name: {contact['first_name']}")
+            if contact.get('last_name'):
+                print(f"Last Name: {contact['last_name']}")
+            if contact.get('company'):
+                print(f"Company: {contact['company']}")
+            if contact.get('job_title'):
+                print(f"Job Title: {contact['job_title']}")
+
         return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -755,6 +770,58 @@ def cmd_find_thread(args):
 
         if emails:
             _display_email_list(emails, show_folder=True)
+
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
+def cmd_download_attachment(args):
+    """Download attachments from an email to a local directory."""
+    try:
+        with OutlookSessionManager() as session:
+            email_item = _get_email_item(session, args.email_id)
+
+            if email_item.Attachments.Count == 0:
+                print("No attachments found on this email.")
+                return 0
+
+            save_dir = args.output_dir or os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(save_dir, exist_ok=True)
+
+            saved = []
+            for i in range(1, email_item.Attachments.Count + 1):
+                attach = email_item.Attachments.Item(i)
+                # Skip embedded images (cid: references) unless --all flag
+                # Only skip if it looks like an image (not PDF/doc/etc)
+                if not args.all and hasattr(attach, 'PropertyAccessor'):
+                    try:
+                        content_id = attach.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001F")
+                        if content_id:
+                            ext = os.path.splitext(attach.FileName)[1].lower()
+                            image_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg'}
+                            if ext in image_exts:
+                                continue
+                    except Exception:
+                        pass
+
+                if args.filename and attach.FileName.lower() != args.filename.lower():
+                    continue
+
+                save_path = os.path.join(save_dir, attach.FileName)
+                attach.SaveAsFile(save_path)
+                size_kb = os.path.getsize(save_path) / 1024
+                saved.append((attach.FileName, save_path, size_kb))
+                print(f"✅ Saved: {attach.FileName} ({size_kb:.1f} KB) → {save_path}")
+
+            if not saved:
+                if args.filename:
+                    print(f"Attachment '{args.filename}' not found.")
+                else:
+                    print("No file attachments found (only embedded images).")
+            else:
+                print(f"\n{len(saved)} attachment(s) saved to: {save_dir}")
 
         return 0
     except Exception as e:
@@ -890,8 +957,8 @@ def main():
     parser_delete.set_defaults(func=cmd_delete_email)
     
     # Lookup contact command
-    parser_lookup = subparsers.add_parser('lookup-contact', help='Look up contact information by email address')
-    parser_lookup.add_argument('email', help='Email address to look up')
+    parser_lookup = subparsers.add_parser('lookup-contact', help='Look up contact information by email or display name')
+    parser_lookup.add_argument('query', help='Email address or display name to look up')
     parser_lookup.set_defaults(func=cmd_lookup_contact)
 
     # Find thread command
@@ -906,6 +973,14 @@ def main():
     parser_related.add_argument('--days', type=int, default=90, help='Days back for sender/keyword strategies')
     parser_related.add_argument('--strategies', type=str, default=None, help='Strategies: thread,sender,keyword (default: all)')
     parser_related.set_defaults(func=cmd_find_related)
+
+    # Download attachment command
+    parser_download = subparsers.add_parser('download-attachment', help='Download attachments from an email to local directory')
+    parser_download.add_argument('email_id', help='Email ID from search results')
+    parser_download.add_argument('--output-dir', help='Directory to save attachments (default: ~/Downloads)')
+    parser_download.add_argument('--filename', help='Download only this specific attachment filename')
+    parser_download.add_argument('--all', action='store_true', help='Include embedded images (default: skip them)')
+    parser_download.set_defaults(func=cmd_download_attachment)
 
     # Index sync command
     # Parse arguments

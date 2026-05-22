@@ -1,6 +1,6 @@
 ---
 name: outlook
-description: Microsoft Outlook email management - search, list, compose, reply, forward, thread tracking
+description: Microsoft Outlook email management - search, list, compose, reply, forward, download attachments, thread tracking
 triggers: [
   "check email", "check inbox", "any new emails", "what's new",
   "show recent emails", "show emails", "list emails",
@@ -11,9 +11,10 @@ triggers: [
   "reply", "forward", "send to",
   "batch forward", "mass forward", "forward to multiple",
   "get email", "view email", "show email details",
+  "download attachment", "save attachment", "get attachment",
   "lookup contact", "who is"
 ]
-operations: ["find-recent", "find", "compose", "reply", "forward", "batch-forward", "contact-lookup", "find-thread", "find-related", "get-email"]
+operations: ["find-recent", "find", "compose", "reply", "forward", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email"]
 ---
 
 # Outlook Skill
@@ -76,9 +77,13 @@ py -3 scripts/outlook_skill.py find-related "<email_id>"
 ### Contact Lookup (Use Before Search by Email)
 ```bash
 py -3 scripts/outlook_skill.py lookup-contact "user@domain.com"
+py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 ```
-- Returns: Display name, company, job title
+- Accepts: Email address OR display name
+- Auto-detects: `@` present → email lookup; no `@` → name lookup via Exchange GAL
+- Returns: Display name, email, company, job title
 - **Why:** Outlook search by email address unreliable; use display name instead
+- **Name lookup:** Resolves display names against Exchange Global Address List
 
 ### ReplyAll (default)
 ```bash
@@ -137,6 +142,18 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 - Preserves original email formatting
 - Automatically splits large recipient lists into batches
 - **Batch size:** Configured in [`backend/config.py`](backend/config.py) (default: 500)
+
+### Download Attachment
+```bash
+py -3 scripts/outlook_skill.py download-attachment "<email_id>"
+py -3 scripts/outlook_skill.py download-attachment "<email_id>" --output-dir "C:\temp"
+py -3 scripts/outlook_skill.py download-attachment "<email_id>" --filename "report.pdf"
+```
+- Saves email attachments to local directory (default: `~/Downloads`)
+- `--output-dir`: Override save location
+- `--filename`: Download only a specific attachment by name
+- `--all`: Include embedded images (default: skips inline images, keeps PDFs/docs)
+- Use with `reply --attach` or `forward --attach` to relay attachments
 
 ### Get Full Email Details
 ```bash
