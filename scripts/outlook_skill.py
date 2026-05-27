@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from backend.outlook_session.session_manager import OutlookSessionManager
 from backend.email_search import (
     list_recent_emails,
+    list_recent_emails_multi,
     search_email_by_subject,
     search_email_by_from,
     search_email_by_to,
@@ -50,7 +51,10 @@ def cmd_list_folders(args):
 def cmd_list_recent(args):
     """List recent emails with their IDs"""
     try:
-        emails, message = list_recent_emails(args.folder, args.days)
+        if args.folder:
+            emails, message = list_recent_emails(args.folder, args.days)
+        else:
+            emails, message = list_recent_emails_multi(days=args.days)
         email_count = len(emails)
         print(f"\n✅ Found {email_count} recent emails\n")
 
@@ -235,7 +239,12 @@ def _display_email_list(emails, show_folder=True):
                 print(f"  - {name} ({size_kb:.1f} KB)")
 
         if embedded_images_count > 0:
-            print(f"\U0001F5BC  Embedded images: {embedded_images_count}")
+            embedded_images = email_data.get('embedded_images', [])
+            if embedded_images:
+                names = ", ".join(img.get('name', 'unknown') for img in embedded_images)
+                print(f"\U0001F5BC  Embedded images ({embedded_images_count}): {names}")
+            else:
+                print(f"\U0001F5BC  Embedded images: {embedded_images_count}")
 
         try:
             with OutlookSessionManager() as session:
@@ -277,7 +286,9 @@ def cmd_search(args):
         print(f"\n✅ {note}\n")
 
         if emails:
-            _display_email_list(emails, show_folder=(folder_names is not None and len(folder_names) > 1))
+            show_folder = (folder_names is not None and len(folder_names) > 1) or \
+                          (folder_names is None and args.folder is None and args.type == "subject")
+            _display_email_list(emails, show_folder=show_folder)
 
         return 0
     except Exception as e:
@@ -301,13 +312,34 @@ def cmd_get_email(args):
                 print(f"CC: {email_item.CC}")
             print(f"Date: {email_item.ReceivedTime}")
             print(f"\nBody:\n{email_item.Body}")
-            
+
             if email_item.Attachments.Count > 0:
-                print("\nAttachments:")
+                regular = []
+                embedded = []
                 for i in range(1, email_item.Attachments.Count + 1):
                     attach = email_item.Attachments.Item(i)
-                    print(f"- {attach.FileName} ({attach.Size} bytes)")
-        
+                    if _is_embedded_image(attach):
+                        embedded.append(attach)
+                    else:
+                        regular.append(attach)
+
+                if regular:
+                    print(f"\n\U0001F4CE Attachments ({len(regular)}):")
+                    for attach in regular:
+                        size_kb = attach.Size / 1024
+                        print(f"  - {attach.FileName} ({size_kb:.1f} KB)")
+
+                if embedded:
+                    import tempfile
+                    temp_dir = os.path.join(tempfile.gettempdir(), "outlook_inline", args.email_id[:16])
+                    os.makedirs(temp_dir, exist_ok=True)
+                    print(f"\n\U0001F5BC  Embedded images (auto-saved):")
+                    for attach in embedded:
+                        save_path = os.path.join(temp_dir, attach.FileName)
+                        attach.SaveAsFile(save_path)
+                        size_kb = attach.Size / 1024
+                        print(f"  - {save_path} ({size_kb:.1f} KB)")
+
         return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -360,6 +392,84 @@ def _add_attachments(mail_item, attach_str):
         mail_item.Attachments.Add(filepath)
 
 
+def _add_inline_images(mail_item, inline_str):
+    """Embed images into the HTML body using CID.
+
+    If the body already contains cid: references for the images, only sets the
+    CID property (user controls placement). Otherwise auto-prepends <img> tags.
+    """
+    if not inline_str:
+        return
+    import os
+    cids = []
+    for filepath in inline_str.split(","):
+        filepath = filepath.strip().strip('"')
+        if not os.path.exists(filepath):
+            print(f"WARNING: Inline image not found: {filepath}")
+            continue
+        filename = os.path.basename(filepath)
+        cid = filename.replace(" ", "_")
+        attachment = mail_item.Attachments.Add(filepath)
+        attachment.PropertyAccessor.SetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
+        )
+        cids.append(cid)
+    if cids and not any(f"cid:{c}" in mail_item.HTMLBody for c in cids):
+        img_html = "".join(f'<img src="cid:{c}" style="max-width:100%;"><br>' for c in cids)
+        mail_item.HTMLBody = img_html + mail_item.HTMLBody
+    elif cids:
+        mail_item.HTMLBody = mail_item.HTMLBody
+
+
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico', '.webp'}
+DOCUMENT_EXTENSIONS = {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.zip', '.rar'}
+
+
+def _is_embedded_image(attachment):
+    """Detect if an attachment is an embedded/inline image (4-method detection)."""
+    file_name = getattr(attachment, 'FileName', '') or getattr(attachment, 'DisplayName', 'Unknown')
+    ext = os.path.splitext(file_name)[1].lower()
+
+    if ext in DOCUMENT_EXTENSIONS:
+        return False
+    if ext not in IMAGE_EXTENSIONS:
+        return False
+
+    # Method 1: Content-ID / Content-Location
+    try:
+        if hasattr(attachment, 'PropertyAccessor'):
+            content_id = attachment.PropertyAccessor.GetProperty(
+                "http://schemas.microsoft.com/mapi/proptag/0x3712001F")
+            if content_id and str(content_id).strip():
+                return True
+            content_loc = attachment.PropertyAccessor.GetProperty(
+                "http://schemas.microsoft.com/mapi/proptag/0x3713001F")
+            if content_loc and str(content_loc).strip():
+                return True
+    except Exception:
+        pass
+
+    # Method 2: Attachment type (3=Embedded, 4=OLE)
+    att_type = getattr(attachment, 'Type', 1)
+    if att_type in (3, 4):
+        return True
+
+    # Method 3: Filename heuristics
+    lower_name = file_name.lower()
+    if any(p in lower_name for p in ('image', 'img', 'cid:', 'embedded')):
+        return True
+    stem = os.path.splitext(lower_name)[0]
+    if stem.isdigit() or (len(stem) <= 2 and stem.isalnum()):
+        return True
+
+    # Method 4: Small image size (< 10 KB)
+    size = getattr(attachment, 'Size', 0)
+    if 0 < size < 10240:
+        return True
+
+    return False
+
+
 def _format_forward_message_html(message_text: str) -> str:
     """Convert plain text or HTML-ish input into the simple prepended block used for forwards."""
     if not message_text:
@@ -387,12 +497,12 @@ def _remove_self_from_recipients(reply, current_user_email):
 def _add_recipients(reply, to_str, cc_str):
     """Append --to and --cc to existing recipients."""
     if to_str:
-        for r in to_str.split(","):
+        for r in to_str.replace(";", ",").split(","):
             r = r.strip()
             if r:
                 reply.Recipients.Add(r)
     if cc_str:
-        for r in cc_str.split(","):
+        for r in cc_str.replace(";", ",").split(","):
             r = r.strip()
             if r:
                 cc_recip = reply.Recipients.Add(r)
@@ -451,6 +561,7 @@ def cmd_replyall(args):
                 return 1
 
             count = reply.Recipients.Count
+            _add_inline_images(reply, args.inline_image)
             _add_attachments(reply, args.attach)
             reply.Send()
             print(f"ReplyAll sent to {count} recipient(s)")
@@ -495,6 +606,7 @@ def cmd_reply(args):
                 return 1
 
             count = reply.Recipients.Count
+            _add_inline_images(reply, args.inline_image)
             _add_attachments(reply, args.attach)
             reply.Send()
             print(f"Reply sent to {count} recipient(s)")
@@ -507,8 +619,8 @@ def cmd_reply(args):
 def cmd_compose(args):
     """Compose and send new email (always HTML format)"""
     try:
-        to_list = [x.strip() for x in args.to.split(",")] if args.to else []
-        cc_list = [x.strip() for x in args.cc.split(",")] if args.cc else []
+        to_list = [x.strip() for x in args.to.replace(";", ",").split(",")] if args.to else []
+        cc_list = [x.strip() for x in args.cc.replace(";", ",").split(",")] if args.cc else []
 
         with OutlookSessionManager() as session:
             mail = session.outlook.CreateItem(0)  # 0 = olMailItem
@@ -529,11 +641,12 @@ def cmd_compose(args):
             # Prepend body to signature HTML (same pattern as reply)
             mail.HTMLBody = args.body + mail.HTMLBody
 
+            _add_inline_images(mail, args.inline_image)
             _add_attachments(mail, args.attach)
             mail.Send()
             total_recipients = len(to_list) + len(cc_list)
             print(f"HTML email sent successfully to {total_recipients} recipient(s)")
-        
+
         return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -616,14 +729,14 @@ def cmd_forward(args):
 
             # Add To recipients
             if args.to:
-                for r in args.to.split(","):
+                for r in args.to.replace(";", ",").split(","):
                     r = r.strip()
                     if r:
                         forward.Recipients.Add(r)
 
             # Add CC recipients
             if args.cc:
-                for r in args.cc.split(","):
+                for r in args.cc.replace(";", ",").split(","):
                     r = r.strip()
                     if r:
                         cc_recip = forward.Recipients.Add(r)
@@ -645,6 +758,7 @@ def cmd_forward(args):
             recipient_count = forward.Recipients.Count
             final_subject = str(getattr(forward, "Subject", original_subject))
 
+            _add_inline_images(forward, args.inline_image)
             _add_attachments(forward, args.attach)
             forward.Send()
             print(f"Forward sent to {recipient_count} recipient(s)")
@@ -685,6 +799,7 @@ def cmd_redirect(args):
             recipient_count = forward.Recipients.Count
             final_subject = forward.Subject
 
+            _add_inline_images(forward, args.inline_image)
             _add_attachments(forward, args.attach)
             forward.Send()
             print(f"Redirected to {recipient_count} recipient(s)")
@@ -781,14 +896,27 @@ def cmd_lookup_contact(args):
                 print()
             print(f"Display Name: {contact['display_name']}")
             print(f"Email: {contact['email']}")
+            if contact.get('alias'):
+                print(f"Alias: {contact['alias']}")
             if contact.get('first_name'):
                 print(f"First Name: {contact['first_name']}")
             if contact.get('last_name'):
                 print(f"Last Name: {contact['last_name']}")
             if contact.get('company'):
                 print(f"Company: {contact['company']}")
+            if contact.get('department'):
+                print(f"Department: {contact['department']}")
             if contact.get('job_title'):
                 print(f"Job Title: {contact['job_title']}")
+            if contact.get('office'):
+                print(f"Office: {contact['office']}")
+            if contact.get('business_phone'):
+                print(f"Business Phone: {contact['business_phone']}")
+            if contact.get('mobile_phone'):
+                print(f"Mobile: {contact['mobile_phone']}")
+            if contact.get('city') or contact.get('state'):
+                location_parts = [p for p in [contact.get('city'), contact.get('state')] if p]
+                print(f"Location: {', '.join(location_parts)}")
 
         return 0
     except Exception as e:
@@ -938,6 +1066,7 @@ def main():
     parser_replyall.add_argument('--to', help='Additional To recipients (comma separated)')
     parser_replyall.add_argument('--cc', help='Additional CC recipients (comma separated)')
     parser_replyall.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_replyall.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_replyall.set_defaults(func=cmd_replyall)
 
     # Reply command (specify mode — sender only, --to/--cc specify extras)
@@ -947,6 +1076,7 @@ def main():
     parser_reply.add_argument('--to', help='Extra To recipients (comma separated)')
     parser_reply.add_argument('--cc', help='Extra CC recipients (comma separated)')
     parser_reply.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_reply.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_reply.set_defaults(func=cmd_reply)
     
     # Compose command
@@ -956,6 +1086,7 @@ def main():
     parser_compose.add_argument('--body', required=True, help='Email body')
     parser_compose.add_argument('--cc', help='CC recipients (comma separated)')
     parser_compose.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_compose.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_compose.set_defaults(func=cmd_compose)
     
     # Forward command
@@ -965,6 +1096,7 @@ def main():
     parser_forward.add_argument('--cc', help='CC recipients (comma separated)')
     parser_forward.add_argument('--body', help='Custom message to prepend')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_forward.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_forward.set_defaults(func=cmd_forward)
 
     # Redirect command (clear all recipients, add new ones)
@@ -974,6 +1106,7 @@ def main():
     parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_redirect.add_argument('--cc', help='CC recipients (comma separated)')
     parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_redirect.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_redirect.set_defaults(func=cmd_redirect)
 
     # Batch forward command

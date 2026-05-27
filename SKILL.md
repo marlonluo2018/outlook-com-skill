@@ -20,6 +20,7 @@ operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "
 # Outlook Skill
 
 > **⚠️ ALL emails use HTML format:** `<p>text</p>`, `<br>`, `<strong>bold</strong>`
+> **⚠️ No closing or signature in email body** — Outlook auto-appends signature. Do not add "Thanks, Marlon" or similar.
 
 ## Commands
 
@@ -27,17 +28,18 @@ operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "
 ```bash
 py -3 scripts/outlook_skill.py find-recent --days 7
 ```
-- Default: **Inbox only** (your sent emails are tracked in task files)
+- Default: **Inbox + Sent Items** (searches both folders to capture full context)
 - Shows: To/CC, attachments, body preview, folder indicator (📥/📤)
 - `--days`: 1-365 (default: 7)
-- `--folder`: override folder (rarely needed)
+- `--folder`: override to search a single folder only
 
 ### Find Emails
 ```bash
 py -3 scripts/outlook_skill.py find --type subject --query "Name" --days 14
 ```
 - Default folder depends on `--type`:
-  - `sender`, `subject`, `body` → **Inbox** only
+  - `subject` → **Inbox + Sent Items** (searches both folders by default)
+  - `sender`, `body` → **Inbox** only
   - `recipient` → **Sent Items** only
 - `--type`: subject, sender, recipient, body
 - `recipient` search matches recipients in sent mail using **To + CC** fields and resolved Outlook recipient names/addresses
@@ -81,7 +83,7 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 ```
 - Accepts: Email address OR display name
 - Auto-detects: `@` present → email lookup; no `@` → name lookup via Exchange GAL
-- Returns: Display name, email, company, job title
+- Returns: Display name, email, alias, company, department, job title, office, phone, mobile, location
 - **Why:** Outlook search by email address unreliable; use display name instead
 - **Name lookup:** Resolves display names against Exchange Global Address List
 
@@ -110,8 +112,10 @@ py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>" --attach "C
 ```bash
 py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>"
 py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML with <img src='cid:pic1'></p>" --inline-image "C:\path\img.png:pic1"
 ```
 - `--attach`: File path(s) to attach (comma separated for multiple)
+- `--inline-image`: Embed image inline via CID (format: `filepath:cid_name`, comma separated)
 - **⚠️ ALWAYS show draft to user in chat window first — NEVER send before user approval**
 - AI presents the email as readable plain text in chat
 - Only call this command after user explicitly confirms "send" or "approve"
@@ -174,6 +178,23 @@ py -3 scripts/outlook_skill.py get-email "<email_id>"
 ```
 - Returns complete email: full body, all attachments, metadata
 - Use after search/thread/related to read the actual content
+- **Embedded images:** Auto-extracted to `%TEMP%\outlook_inline\<id>\`. Paths printed in output — use Read tool to view.
+
+### Sending Inline Images
+```bash
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML with <img src='cid:myimage'></p>" --inline-image "C:\path\image.png:myimage"
+```
+- `--inline-image`: Format is `filepath:cid_name` (comma separated for multiple)
+- Reference in HTML body via `<img src="cid:cid_name">`
+- Works with `compose`, `reply`, `replyall`, `forward`, `redirect`
+
+### Viewing Embedded Images
+When search results show `🖼 Embedded images (N): filename.png, ...`:
+1. Use `get-email "<id>"` — images auto-save to temp with paths printed
+2. Use Read tool on the printed path to view the image
+3. AI describes or acts on image content
+
+No extra user command needed — AI handles download + viewing transparently.
 
 ## Configuration
 

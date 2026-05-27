@@ -94,7 +94,19 @@ def unified_search(
         else:
             # Single folder search — extract to dicts inside session
             # Default folder depends on search type:
-            #   sender/subject/body → Inbox, recipient → Sent Items
+            #   subject → Inbox + Sent Items (multi-folder)
+            #   sender/body → Inbox, recipient → Sent Items
+            if folder_name is None and search_type == "subject":
+                from .server_search import DEFAULT_SEARCH_FOLDERS
+                email_list = multi_folder_search(
+                    search_term, days, search_type, DEFAULT_SEARCH_FOLDERS, match_all
+                )
+                folder_label = " + ".join(DEFAULT_SEARCH_FOLDERS)
+                if not email_list:
+                    return [], f"No emails found matching '{search_term}'"
+                message = f"Found {len(email_list)} emails in '{folder_label}'"
+                return email_list, message
+
             if folder_name is None and search_type == "recipient":
                 folder_path = "Sent Items"
             else:

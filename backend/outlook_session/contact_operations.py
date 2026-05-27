@@ -12,6 +12,32 @@ from .session_manager import OutlookSessionManager
 logger = get_logger(__name__)
 
 
+def _extract_exchange_user_info(exchange_user) -> Dict[str, Any]:
+    """Extract all available fields from an ExchangeUser COM object."""
+    def _safe_get(attr):
+        try:
+            val = getattr(exchange_user, attr, None)
+            return val if val else None
+        except Exception:
+            return None
+
+    return {
+        'display_name': _safe_get('Name'),
+        'email': _safe_get('PrimarySmtpAddress'),
+        'first_name': _safe_get('FirstName'),
+        'last_name': _safe_get('LastName'),
+        'company': _safe_get('CompanyName'),
+        'job_title': _safe_get('JobTitle'),
+        'department': _safe_get('Department'),
+        'office': _safe_get('OfficeLocation'),
+        'business_phone': _safe_get('BusinessTelephoneNumber'),
+        'mobile_phone': _safe_get('MobileTelephoneNumber'),
+        'city': _safe_get('City'),
+        'state': _safe_get('StateOrProvince'),
+        'alias': _safe_get('Alias'),
+    }
+
+
 def get_contact_by_email(email_address: str) -> Optional[Dict[str, Any]]:
     """
     Look up a contact by email address and return their information.
@@ -38,10 +64,17 @@ def get_contact_by_email(email_address: str) -> Optional[Dict[str, Any]]:
                         return {
                             'display_name': contact.FullName or contact.FileAs,
                             'email': email_address,
-                            'first_name': contact.FirstName,
-                            'last_name': contact.LastName,
-                            'company': contact.CompanyName,
-                            'job_title': contact.JobTitle
+                            'first_name': getattr(contact, 'FirstName', None),
+                            'last_name': getattr(contact, 'LastName', None),
+                            'company': getattr(contact, 'CompanyName', None),
+                            'job_title': getattr(contact, 'JobTitle', None),
+                            'department': getattr(contact, 'Department', None),
+                            'office': getattr(contact, 'OfficeLocation', None),
+                            'business_phone': getattr(contact, 'BusinessTelephoneNumber', None),
+                            'mobile_phone': getattr(contact, 'MobileTelephoneNumber', None),
+                            'city': getattr(contact, 'BusinessAddressCity', None),
+                            'state': getattr(contact, 'BusinessAddressState', None),
+                            'alias': None,
                         }
                 except Exception as e:
                     logger.debug(f"Error searching Email{i}Address: {e}")
@@ -51,20 +84,13 @@ def get_contact_by_email(email_address: str) -> Optional[Dict[str, Any]]:
             try:
                 recipient = session.outlook.Session.CreateRecipient(email_address)
                 recipient.Resolve()
-                
+
                 if recipient.Resolved:
                     address_entry = recipient.AddressEntry
                     exchange_user = address_entry.GetExchangeUser()
-                    
+
                     if exchange_user:
-                        return {
-                            'display_name': exchange_user.Name,
-                            'email': exchange_user.PrimarySmtpAddress,
-                            'first_name': exchange_user.FirstName,
-                            'last_name': exchange_user.LastName,
-                            'company': exchange_user.CompanyName,
-                            'job_title': exchange_user.JobTitle
-                        }
+                        return _extract_exchange_user_info(exchange_user)
                     else:
                         return {
                             'display_name': address_entry.Name,
@@ -72,7 +98,14 @@ def get_contact_by_email(email_address: str) -> Optional[Dict[str, Any]]:
                             'first_name': None,
                             'last_name': None,
                             'company': None,
-                            'job_title': None
+                            'job_title': None,
+                            'department': None,
+                            'office': None,
+                            'business_phone': None,
+                            'mobile_phone': None,
+                            'city': None,
+                            'state': None,
+                            'alias': None,
                         }
             except Exception as e:
                 logger.debug(f"Error resolving via Exchange: {e}")
@@ -104,14 +137,7 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
                 exchange_user = address_entry.GetExchangeUser()
 
                 if exchange_user:
-                    return [{
-                        'display_name': exchange_user.Name,
-                        'email': exchange_user.PrimarySmtpAddress,
-                        'first_name': exchange_user.FirstName,
-                        'last_name': exchange_user.LastName,
-                        'company': exchange_user.CompanyName,
-                        'job_title': exchange_user.JobTitle
-                    }]
+                    return [_extract_exchange_user_info(exchange_user)]
                 else:
                     return [{
                         'display_name': address_entry.Name,
@@ -119,7 +145,14 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
                         'first_name': None,
                         'last_name': None,
                         'company': None,
-                        'job_title': None
+                        'job_title': None,
+                        'department': None,
+                        'office': None,
+                        'business_phone': None,
+                        'mobile_phone': None,
+                        'city': None,
+                        'state': None,
+                        'alias': None,
                     }]
 
             # Ambiguous or not found — search GAL directly
@@ -143,14 +176,7 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
                         try:
                             exchange_user = entry.GetExchangeUser()
                             if exchange_user:
-                                results.append({
-                                    'display_name': exchange_user.Name,
-                                    'email': exchange_user.PrimarySmtpAddress,
-                                    'first_name': exchange_user.FirstName,
-                                    'last_name': exchange_user.LastName,
-                                    'company': exchange_user.CompanyName,
-                                    'job_title': exchange_user.JobTitle
-                                })
+                                results.append(_extract_exchange_user_info(exchange_user))
                         except Exception:
                             pass
                     else:

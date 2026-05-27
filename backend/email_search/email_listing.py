@@ -45,6 +45,34 @@ def list_recent_emails(folder_name: str = "Inbox", days: int = None) -> Tuple[Li
     return emails, f"Found {len(emails)} emails in '{params.folder_name}'{days_str}"
 
 
+def list_recent_emails_multi(folder_names: list = None, days: int = None) -> Tuple[List[Dict[str, Any]], str]:
+    """List recent emails from multiple folders (default: Inbox + Sent Items).
+    Returns (emails, message) tuple. Each email dict includes 'folder_name'.
+    """
+    from .server_search import DEFAULT_SEARCH_FOLDERS
+    if folder_names is None:
+        folder_names = DEFAULT_SEARCH_FOLDERS
+
+    effective_days = days or 30
+
+    all_emails = []
+    seen_ids = set()
+
+    for fname in folder_names:
+        emails, _ = get_emails_from_folder_optimized(folder_name=fname, days=effective_days)
+        for email in emails:
+            eid = email.get("entry_id", "")
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                email["folder_name"] = fname
+                all_emails.append(email)
+
+    all_emails.sort(key=lambda x: x.get("received_time", ""), reverse=True)
+
+    folder_label = " + ".join(folder_names)
+    return all_emails, f"Found {len(all_emails)} emails in '{folder_label}' from last {effective_days} days"
+
+
 def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7) -> Tuple[List[Dict[str, Any]], str]:
     """
     Optimized version of get_emails_from_folder with performance improvements.

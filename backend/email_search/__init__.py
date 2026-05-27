@@ -16,7 +16,7 @@ from .recipient_search import search_email_by_recipient
 from .body_search import search_email_by_body
 
 # Import from email listing module
-from .email_listing import list_recent_emails, get_emails_from_folder
+from .email_listing import list_recent_emails, list_recent_emails_multi, get_emails_from_folder
 
 # Import from outlook_session modules (moved from search_utils)
 from ..outlook_session.folder_operations import get_folder_emails, list_folders
@@ -56,6 +56,7 @@ __all__ = [
     # Email listing functions
     "list_folders",
     "list_recent_emails",
+    "list_recent_emails_multi",
     "get_emails_from_folder",
     "get_folder_emails",
 

@@ -121,6 +121,7 @@ def extract_email_info_minimal(item) -> Dict[str, Any]:
         has_attachments = False
         attachments_list = []
         embedded_images_count = 0
+        embedded_images_list = []
         try:
             attachments = getattr(item, 'Attachments', None)
             if attachments and hasattr(attachments, 'Count') and attachments.Count > 0:
@@ -177,9 +178,13 @@ def extract_email_info_minimal(item) -> Dict[str, Any]:
                     if is_document:
                         is_embedded = False
                     
-                    # Count embedded images
+                    # Count embedded images and collect filenames
                     if is_embedded and is_image:
                         embedded_images_count += 1
+                        embedded_images_list.append({
+                            "name": file_name,
+                            "size": getattr(attachment, 'Size', 0)
+                        })
                     # Only add non-embedded attachments to the list
                     elif not is_embedded:
                         attachment_info = {
@@ -210,6 +215,7 @@ def extract_email_info_minimal(item) -> Dict[str, Any]:
             "attachments": attachments_list,
             "attachments_count": len(attachments_list),
             "embedded_images_count": embedded_images_count,
+            "embedded_images": embedded_images_list,
             "attachments_processed": True
         }
     except Exception as e:
