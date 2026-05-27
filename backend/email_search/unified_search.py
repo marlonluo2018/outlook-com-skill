@@ -261,6 +261,7 @@ def find_related_emails(
     email_id: str,
     days: int = 90,
     strategies: Optional[List[str]] = None,
+    exclude_thread: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     Find emails related to the given email using multiple strategies.
@@ -268,12 +269,14 @@ def find_related_emails(
     Strategies (in order of confidence):
     - thread: Same conversation ID (confidence=1.0)
     - sender: Same sender within time window (confidence=0.7)
+    - recipient: Shared recipients (confidence=0.6)
     - keyword: Shared keywords in subject (confidence=0.4)
 
     Args:
         email_id: EntryID of the reference email
-        days: Lookback days for sender and keyword strategies
+        days: Lookback days for sender, recipient, and keyword strategies
         strategies: Which strategies to use (default: all)
+        exclude_thread: If True, skip the thread strategy
 
     Returns:
         Tuple of (list of email dicts sorted by relevance, status message)
@@ -285,7 +288,7 @@ def find_related_emails(
         days = search_config.MAX_SEARCH_DAYS
 
     try:
-        result = search_related_emails(email_id, days, strategies)
+        result = search_related_emails(email_id, days, strategies, exclude_thread=exclude_thread)
         combined = result.get("combined", [])
 
         if not combined:
@@ -298,6 +301,7 @@ def find_related_emails(
         ref_info = result.get("reference_email", {})
         thread_count = len(result.get("thread_results", []))
         sender_count = len(result.get("sender_results", []))
+        recipient_count = len(result.get("recipient_results", []))
         keyword_count = len(result.get("keyword_results", []))
 
         strategy_parts = []
@@ -305,6 +309,8 @@ def find_related_emails(
             strategy_parts.append(f"{thread_count} by thread")
         if sender_count:
             strategy_parts.append(f"{sender_count} by sender")
+        if recipient_count:
+            strategy_parts.append(f"{recipient_count} by recipient")
         if keyword_count:
             strategy_parts.append(f"{keyword_count} by keyword")
 

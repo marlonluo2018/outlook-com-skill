@@ -418,10 +418,32 @@ def search_by_conversation_id(conversation_id: str, folder_names: Optional[List[
         )
 
 
+def _extract_recipient_set(email_info: dict, exclude_address: str = "") -> set:
+    """Extract all recipient addresses (lowercase) from to + cc, excluding the given address."""
+    addresses = set()
+    exclude_lower = exclude_address.lower().strip()
+    for recip in email_info.get("to_recipients", []) + email_info.get("cc_recipients", []):
+        addr = (recip.get("address") or "").lower().strip()
+        if addr and addr != exclude_lower:
+            addresses.add(addr)
+    return addresses
+
+
+def _count_recipient_overlap(candidate_info: dict, ref_recipients: set) -> int:
+    """Count how many of the reference recipients appear in the candidate's to/cc/sender."""
+    candidate_addrs = set()
+    for recip in candidate_info.get("to_recipients", []) + candidate_info.get("cc_recipients", []):
+        addr = (recip.get("address") or "").lower().strip()
+        if addr:
+            candidate_addrs.add(addr)
+    return len(ref_recipients & candidate_addrs)
+
+
 def search_related_emails(
     email_id: str,
     days: int = 90,
     strategies: Optional[List[str]] = None,
+    exclude_thread: bool = False,
 ) -> dict:
     """
     Find emails related to a given email using multiple strategies.
@@ -429,23 +451,29 @@ def search_related_emails(
     Strategies:
     - thread: Same conversation ID (highest confidence)
     - sender: Same sender within expanded time window
+    - recipient: Shared recipients (people overlap)
     - keyword: Extract key terms and search subject/body
 
     Args:
         email_id: EntryID of the reference email
-        days: Lookback window for sender and keyword strategies
-        strategies: List of strategies to use (default: all three)
+        days: Lookback window for sender, recipient, and keyword strategies
+        strategies: List of strategies to use (default: all four)
+        exclude_thread: If True, skip the thread strategy
 
     Returns:
         Dict with strategy results and combined ranked list
     """
     if strategies is None:
-        strategies = ["thread", "sender", "keyword"]
+        strategies = ["thread", "sender", "recipient", "keyword"]
+
+    if exclude_thread and "thread" in strategies:
+        strategies = [s for s in strategies if s != "thread"]
 
     output = {
         "reference_email": None,
         "thread_results": [],
         "sender_results": [],
+        "recipient_results": [],
         "keyword_results": [],
         "combined": [],
     }
@@ -466,6 +494,7 @@ def search_related_emails(
         seen_ids = {email_id}
         thread_results = []
         sender_results = []
+        recipient_results = []
         keyword_results = []
 
         # Strategy 1: Thread (ConversationID)
@@ -541,7 +570,73 @@ def search_related_emails(
                 logger.info(f"Strategy 'sender': found {len(sender_results)}")
             output["sender_results"] = sender_results
 
-        # Strategy 3: Keyword extraction + subject search
+        # Strategy 3: Recipient overlap (shared people)
+        if "recipient" in strategies:
+            try:
+                current_user = session.outlook.Session.CurrentUser
+                eu = current_user.AddressEntry.GetExchangeUser()
+                my_email = (eu.PrimarySmtpAddress if eu else "").lower()
+            except Exception:
+                my_email = ""
+
+            ref_recipients = _extract_recipient_set(ref_info, exclude_address=my_email)
+            try:
+                sender_addr = (getattr(ref_item, 'SenderEmailAddress', '') or '').lower().strip()
+                if sender_addr and sender_addr != my_email and '@' in sender_addr:
+                    ref_recipients.add(sender_addr)
+            except Exception:
+                pass
+
+            if len(ref_recipients) >= 1:
+                namespace = getattr(session, 'outlook_namespace', None)
+                # Use display names for sender search (more reliable than addresses)
+                ref_names = set()
+                for recip in ref_info.get("to_recipients", []) + ref_info.get("cc_recipients", []):
+                    name = (recip.get("name") or "").strip()
+                    if name and name.lower() != my_email:
+                        ref_names.add(name)
+                search_names = list(ref_names)[:3]
+                for name in search_names:
+                    recip_criteria = _build_search_criteria(
+                        name, days, "sender", match_all=True
+                    )
+                    for folder_name in ["Inbox", "Sent Items"]:
+                        try:
+                            folder = session.get_folder(folder_name)
+                            if not folder:
+                                continue
+                            items = _search_single_folder(
+                                folder,
+                                recip_criteria,
+                                max_results=50,
+                                namespace=namespace,
+                                search_type="sender",
+                            )
+                            for item in items:
+                                eid = getattr(item, 'EntryID', '')
+                                if eid and eid not in seen_ids:
+                                    info = extract_email_info(item)
+                                    if not info:
+                                        continue
+                                    overlap = _count_recipient_overlap(
+                                        info, ref_recipients
+                                    )
+                                    if overlap < 2:
+                                        continue
+                                    seen_ids.add(eid)
+                                    info["_confidence"] = min(
+                                        0.55 + (0.05 * max(overlap - 2, 0)),
+                                        0.70,
+                                    )
+                                    info["_strategy"] = "recipient"
+                                    info["_recipient_overlap"] = overlap
+                                    recipient_results.append(info)
+                        except Exception as e:
+                            logger.warning(f"Recipient strategy error in '{folder_name}': {e}")
+                logger.info(f"Strategy 'recipient': found {len(recipient_results)}")
+            output["recipient_results"] = recipient_results
+
+        # Strategy 4: Keyword extraction + subject search
         if "keyword" in strategies:
             keywords = _extract_search_keywords(ref_info)
             if keywords:
@@ -606,7 +701,7 @@ def search_related_emails(
             output["keyword_results"] = keyword_results
 
         # Combine and sort by confidence (desc), then by time (desc)
-        all_combined = thread_results + sender_results + keyword_results
+        all_combined = thread_results + sender_results + recipient_results + keyword_results
         try:
             all_combined.sort(
                 key=lambda x: (

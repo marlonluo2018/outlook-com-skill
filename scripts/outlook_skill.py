@@ -1008,6 +1008,7 @@ def cmd_find_related(args):
             args.email_id,
             days=args.days,
             strategies=strategies,
+            exclude_thread=args.exclude_thread,
         )
         print(f"\n🔗 {message}\n")
 
@@ -1153,7 +1154,8 @@ def main():
     parser_related = subparsers.add_parser('find-related', help='Find emails related to a given email')
     parser_related.add_argument('email_id', help='Email ID from search results')
     parser_related.add_argument('--days', type=int, default=90, help='Days back for sender/keyword strategies')
-    parser_related.add_argument('--strategies', type=str, default=None, help='Strategies: thread,sender,keyword (default: all)')
+    parser_related.add_argument('--strategies', type=str, default=None, help='Strategies: thread,sender,recipient,keyword (default: all)')
+    parser_related.add_argument('--exclude-thread', action='store_true', help='Skip thread strategy (useful after find-thread)')
     parser_related.set_defaults(func=cmd_find_related)
 
     # Download attachment command

@@ -63,18 +63,21 @@ py -3 scripts/outlook_skill.py find-thread "<email_id>"
 ### Find Related Emails
 ```bash
 py -3 scripts/outlook_skill.py find-related "<email_id>"
+py -3 scripts/outlook_skill.py find-related "<email_id>" --exclude-thread
+py -3 scripts/outlook_skill.py find-related "<email_id>" --strategies recipient,keyword
 ```
 - **Auto-searches Inbox + Sent Items** — multi-strategy needs full data
-- Strategies: thread (★5) + sender (★3) + keyword (★2)
-- Results sorted by relevance
+- Output includes relevance stars (★) and strategy name per result
 - Multi-strategy search for emails related to a given email:
   - **thread** (★5): Same ConversationID
-  - **sender** (★3): Same sender within time window, but only when the email also overlaps with the reference topic
-  - **keyword** (★2): Shared meaningful topic keywords from the subject/content
+  - **sender** (★3-4): Same sender within time window + topic keyword overlap
+  - **recipient** (★3): Shared recipients (≥2 people overlap in To/CC)
+  - **keyword** (★2-3): Shared meaningful topic keywords from subject
 - Generic noise terms such as external/training/request are intentionally ignored during keyword extraction
 - Sender and keyword matching are intentionally tighter to reduce unrelated same-sender and boilerplate matches
-- Results sorted by relevance (confidence score)
-- `--strategies`: comma-separated (default: all three)
+- Results sorted by confidence then time (newest first within same confidence)
+- `--strategies`: comma-separated (default: all four)
+- `--exclude-thread`: skip thread strategy (useful after `find-thread` to avoid duplicates)
 
 ### Contact Lookup (Use Before Search by Email)
 ```bash
