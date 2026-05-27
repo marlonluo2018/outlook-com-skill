@@ -38,8 +38,8 @@ py -3 scripts/outlook_skill.py find-recent --days 7
 py -3 scripts/outlook_skill.py find --type subject --query "Name" --days 14
 ```
 - Default folder depends on `--type`:
-  - `subject` → **Inbox + Sent Items** (searches both folders by default)
-  - `sender`, `body` → **Inbox** only
+  - `subject`, `body` → **Inbox + Sent Items** (searches both folders by default)
+  - `sender` → **Inbox** only
   - `recipient` → **Sent Items** only
 - `--type`: subject, sender, recipient, body
 - `recipient` search matches recipients in sent mail using **To + CC** fields and resolved Outlook recipient names/addresses

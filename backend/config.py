@@ -183,6 +183,7 @@ class SearchConfig:
     DIRECT_FIND_DEFAULT_DAYS = 14  # Default days for direct `find` searches; AI should usually start narrow first
     RELATED_SEARCH_DAYS = 90  # Default lookback for find-related
     THREAD_SEARCH_DAYS = 365  # Thread search covers full history
+    BODY_SEARCH_MAX_CHARS = 2000  # Max characters to read from Body in manual fallback scan
 
 
 

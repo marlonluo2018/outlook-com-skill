@@ -28,7 +28,7 @@ def get_date_limit(days: int) -> datetime:
 
 def is_server_search_supported(search_type: str) -> bool:
     """Check if server-side search is supported for the given search type."""
-    return search_type in ["subject", "sender", "recipient"]
+    return search_type in ["subject", "sender", "recipient", "body"]
 
 
 # COM attribute cache to avoid repeated access - OPTIMIZED VERSION

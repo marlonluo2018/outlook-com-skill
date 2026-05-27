@@ -13,6 +13,7 @@ from typing import Any, List, Optional, Tuple
 # Local application imports
 from ..logging_config import get_logger
 from ..outlook_session.session_manager import OutlookSessionManager
+from ..config import search_config
 from .search_common import get_date_limit
 
 logger = get_logger(__name__)
@@ -184,7 +185,12 @@ def _search_single_folder(
                         except Exception:
                             pass
                     elif search_type == "body":
-                        searchable_parts.append(getattr(item, 'Body', '') or '')
+                        subject_text = (getattr(item, 'Subject', '') or '').lower()
+                        if not any(term in subject_text for term in search_terms):
+                            body_text = (getattr(item, 'Body', '') or '')[:search_config.BODY_SEARCH_MAX_CHARS]
+                            searchable_parts.append(body_text)
+                        else:
+                            searchable_parts.append(subject_text)
                     else:
                         searchable_parts.append(getattr(item, 'Subject', '') or '')
                         searchable_parts.append(getattr(item, 'SenderName', '') or '')

@@ -96,7 +96,7 @@ def unified_search(
             # Default folder depends on search type:
             #   subject → Inbox + Sent Items (multi-folder)
             #   sender/body → Inbox, recipient → Sent Items
-            if folder_name is None and search_type == "subject":
+            if folder_name is None and search_type in ("subject", "body"):
                 from .server_search import DEFAULT_SEARCH_FOLDERS
                 email_list = multi_folder_search(
                     search_term, days, search_type, DEFAULT_SEARCH_FOLDERS, match_all
