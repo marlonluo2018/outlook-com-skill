@@ -74,26 +74,17 @@ def _search_single_folder(
     """
     folder_path = getattr(folder, 'FolderPath', str(folder))
     need_fallback = False
-    use_restrict = search_type != "conversation"
 
-    if use_restrict:
-        try:
-            items = folder.Items
-            restricted_items = items.Restrict(search_criteria)
-            results = list(restricted_items)
-            logger.info(f"Restrict found {len(results)} results in '{folder.Name}'")
-            if results:
-                return results[:max_results]
-            # 0 results — don't trust it; DAV properties may be unsupported
-            need_fallback = True
-        except Exception as e:
-            logger.warning(f"Restrict failed for '{folder.Name}': {e}")
-            need_fallback = True
-    else:
-        logger.info(
-            f"Skipping Restrict for conversation search in '{folder.Name}' "
-            f"and using manual scan directly"
-        )
+    try:
+        items = folder.Items
+        restricted_items = items.Restrict(search_criteria)
+        results = list(restricted_items)
+        logger.info(f"Restrict found {len(results)} results in '{folder.Name}'")
+        if results:
+            return results[:max_results]
+        need_fallback = True
+    except Exception as e:
+        logger.warning(f"Restrict failed for '{folder.Name}': {e}")
         need_fallback = True
 
     if not need_fallback:
@@ -215,6 +206,63 @@ def _search_single_folder(
         )
 
     return []
+
+
+def _scan_folder_items_by_date(
+    session,
+    folder_name: str,
+    days: int,
+    max_items: int = 2000,
+) -> List[dict]:
+    """Scan a folder once and return all email dicts within date range.
+
+    Used by find-related to build a merged pool so that sender/recipient/keyword
+    strategies filter in-memory instead of each calling _search_single_folder.
+    Each dict includes '_sender_email' for strategy matching.
+    """
+    from .search_common import extract_email_info
+
+    folder = session.get_folder(folder_name)
+    if not folder:
+        return []
+
+    date_limit = get_date_limit(days)
+    results = []
+
+    try:
+        items = folder.Items
+        try:
+            items.Sort("[ReceivedTime]", True)
+        except Exception:
+            pass
+
+        total = getattr(items, 'Count', 0)
+        for i in range(min(total, max_items)):
+            try:
+                item = items.Item(i + 1)
+                if not item:
+                    continue
+                if hasattr(item, 'Class') and item.Class != 43:
+                    continue
+                if hasattr(item, 'ReceivedTime') and item.ReceivedTime:
+                    item_time = item.ReceivedTime
+                    if getattr(item_time, 'tzinfo', None) is None:
+                        item_time = item_time.replace(tzinfo=timezone.utc)
+                    if item_time < date_limit:
+                        break  # sorted desc, so no more matches
+                info = extract_email_info(item)
+                if info:
+                    info['_sender_email'] = (
+                        getattr(item, 'SenderEmailAddress', '') or ''
+                    ).lower().strip()
+                    results.append(info)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"_scan_folder_items_by_date error in '{folder_name}': {e}")
+
+    logger.info(f"Scanned '{folder_name}': {len(results)} items within {days} days")
+    return results
 
 
 def _resolve_folders(session, folder_names: Optional[List[str]] = None) -> List[Any]:
@@ -424,6 +472,69 @@ def search_by_conversation_id(conversation_id: str, folder_names: Optional[List[
         )
 
 
+def _fuzzy_subject_match(
+    session,
+    ref_info: dict,
+    folder_names: List[str],
+    seen_ids: set,
+    days: Optional[int] = None,
+) -> List[dict]:
+    """Find emails with similar subjects using token overlap (Jaccard similarity).
+
+    Used as a fallback when ConversationID is broken (e.g., forwarded threads,
+    cross-tenant replies). Only activates when subject has enough tokens.
+    """
+    import re
+
+    subject = ref_info.get("subject", "")
+    # Strip RE:/FW: and bracketed tags
+    cleaned = subject
+    for prefix in ["RE:", "Re:", "FW:", "Fwd:", "FWD:"]:
+        cleaned = cleaned.replace(prefix, "")
+    cleaned = re.sub(r"\[[^\]]+\]", " ", cleaned).strip()
+
+    tokens = set(re.findall(r"[A-Za-z0-9]+", cleaned.lower()))
+    tokens -= {"re", "fw", "fwd"}
+    if len(tokens) < 3:
+        return []
+
+    if days is None:
+        days = search_config.FUZZY_TIME_PROXIMITY_DAYS
+
+    threshold = search_config.FUZZY_SUBJECT_SIMILARITY_THRESHOLD
+    results = []
+
+    for folder_name in folder_names:
+        pool = _scan_folder_items_by_date(session, folder_name, days)
+        for info in pool:
+            eid = info.get('entry_id', '')
+            if not eid or eid in seen_ids:
+                continue
+            cand_subject = info.get("subject", "")
+            cand_cleaned = cand_subject
+            for prefix in ["RE:", "Re:", "FW:", "Fwd:", "FWD:"]:
+                cand_cleaned = cand_cleaned.replace(prefix, "")
+            cand_cleaned = re.sub(r"\[[^\]]+\]", " ", cand_cleaned).strip()
+            cand_tokens = set(re.findall(r"[A-Za-z0-9]+", cand_cleaned.lower()))
+            cand_tokens -= {"re", "fw", "fwd"}
+
+            if not cand_tokens:
+                continue
+            intersection = tokens & cand_tokens
+            union = tokens | cand_tokens
+            overlap = len(intersection) / len(union) if union else 0
+            if overlap >= threshold:
+                seen_ids.add(eid)
+                matched = dict(info)
+                matched["_confidence"] = min(0.40 + 0.20 * overlap, 0.60)
+                matched["_strategy"] = "fuzzy"
+                matched["_subject_overlap"] = round(overlap, 2)
+                results.append(matched)
+
+    logger.info(f"Fuzzy subject match: found {len(results)} results")
+    return results
+
+
 def _extract_recipient_set(email_info: dict, exclude_address: str = "") -> set:
     """Extract all recipient addresses (lowercase) from to + cc, excluding the given address."""
     addresses = set()
@@ -495,6 +606,9 @@ def search_related_emails(
         from .search_common import extract_email_info
 
         ref_info = extract_email_info(ref_item)
+        ref_info["_body_text"] = (
+            (getattr(ref_item, 'Body', '') or '')[:search_config.BODY_KEYWORD_EXTRACT_CHARS]
+        )
         output["reference_email"] = ref_info
 
         seen_ids = {email_id}
@@ -524,7 +638,17 @@ def search_related_emails(
                 logger.info(f"Strategy 'thread': found {len(thread_results)}")
             output["thread_results"] = thread_results
 
-        # Strategy 2: Same sender + time window
+        # Build merged pool for sender/recipient/keyword strategies (single scan per folder)
+        need_pool = any(s in strategies for s in ("sender", "recipient", "keyword"))
+        merged_pool = []
+        if need_pool:
+            for folder_name in ["Inbox", "Sent Items"]:
+                merged_pool.extend(
+                    _scan_folder_items_by_date(session, folder_name, days)
+                )
+            logger.info(f"Merged pool: {len(merged_pool)} items for strategy matching")
+
+        # Strategy 2: Same sender + topic keyword overlap
         if "sender" in strategies:
             sender_name = ref_info.get("sender", "")
             if sender_name and sender_name != "Unknown":
@@ -533,46 +657,29 @@ def search_related_emails(
                     sender_keywords
                 )
                 sender_topic_keywords = sender_strong_keywords or sender_keywords[:1]
+                sender_name_lower = sender_name.lower()
 
-                sender_criteria = _build_search_criteria(
-                    sender_name, days, "sender", match_all=True
-                )
-                namespace = getattr(session, 'outlook_namespace', None)
-                for folder_name in ["Inbox", "Sent Items"]:
-                    try:
-                        folder = session.get_folder(folder_name)
-                        if not folder:
-                            continue
-                        items = _search_single_folder(
-                            folder,
-                            sender_criteria,
-                            max_results=100,
-                            namespace=namespace,
-                            search_type="sender",
-                        )
-                        for item in items:
-                            eid = getattr(item, 'EntryID', '')
-                            if eid and eid not in seen_ids:
-                                info = extract_email_info(item)
-                                if not info:
-                                    continue
-
-                                sender_overlap = _count_keyword_overlap(
-                                    info, sender_topic_keywords
-                                )
-                                if sender_topic_keywords and sender_overlap < 1:
-                                    continue
-
-                                seen_ids.add(eid)
-                                info["_confidence"] = min(
-                                    0.60 + (0.05 * max(sender_overlap - 1, 0)),
-                                    0.75,
-                                )
-                                info["_strategy"] = "sender"
-                                info["_sender_keyword_overlap"] = sender_overlap
-                                sender_results.append(info)
-                    except Exception as e:
-                        logger.warning(f"Sender strategy error in '{folder_name}': {e}")
+                for info in merged_pool:
+                    eid = info.get('entry_id', '')
+                    if not eid or eid in seen_ids:
+                        continue
+                    candidate_sender = (info.get("sender") or "").lower()
+                    if sender_name_lower not in candidate_sender:
+                        continue
+                    sender_overlap = _count_keyword_overlap(
+                        info, sender_topic_keywords
+                    )
+                    if sender_topic_keywords and sender_overlap < 1:
+                        continue
+                    seen_ids.add(eid)
+                    matched = dict(info)
+                    matched["_confidence"] = min(
+                        0.60 + (0.05 * max(sender_overlap - 1, 0)),
+                        0.75,
+                    )
+                    matched["_strategy"] = "sender"
+                    matched["_sender_keyword_overlap"] = sender_overlap
+                    sender_results.append(matched)
                 logger.info(f"Strategy 'sender': found {len(sender_results)}")
             output["sender_results"] = sender_results
 
@@ -594,59 +701,29 @@ def search_related_emails(
                 pass
 
             if len(ref_recipients) >= 1:
-                namespace = getattr(session, 'outlook_namespace', None)
-                # Use display names for sender search (more reliable than addresses)
-                ref_names = set()
-                for recip in ref_info.get("to_recipients", []) + ref_info.get("cc_recipients", []):
-                    name = (recip.get("name") or "").strip()
-                    if name and name.lower() != my_email:
-                        ref_names.add(name)
-                search_names = list(ref_names)[:3]
-                for name in search_names:
-                    recip_criteria = _build_search_criteria(
-                        name, days, "sender", match_all=True
+                for info in merged_pool:
+                    eid = info.get('entry_id', '')
+                    if not eid or eid in seen_ids:
+                        continue
+                    overlap = _count_recipient_overlap(info, ref_recipients)
+                    if overlap < 2:
+                        continue
+                    seen_ids.add(eid)
+                    matched = dict(info)
+                    matched["_confidence"] = min(
+                        0.55 + (0.05 * max(overlap - 2, 0)),
+                        0.70,
                     )
-                    for folder_name in ["Inbox", "Sent Items"]:
-                        try:
-                            folder = session.get_folder(folder_name)
-                            if not folder:
-                                continue
-                            items = _search_single_folder(
-                                folder,
-                                recip_criteria,
-                                max_results=50,
-                                namespace=namespace,
-                                search_type="sender",
-                            )
-                            for item in items:
-                                eid = getattr(item, 'EntryID', '')
-                                if eid and eid not in seen_ids:
-                                    info = extract_email_info(item)
-                                    if not info:
-                                        continue
-                                    overlap = _count_recipient_overlap(
-                                        info, ref_recipients
-                                    )
-                                    if overlap < 2:
-                                        continue
-                                    seen_ids.add(eid)
-                                    info["_confidence"] = min(
-                                        0.55 + (0.05 * max(overlap - 2, 0)),
-                                        0.70,
-                                    )
-                                    info["_strategy"] = "recipient"
-                                    info["_recipient_overlap"] = overlap
-                                    recipient_results.append(info)
-                        except Exception as e:
-                            logger.warning(f"Recipient strategy error in '{folder_name}': {e}")
+                    matched["_strategy"] = "recipient"
+                    matched["_recipient_overlap"] = overlap
+                    recipient_results.append(matched)
                 logger.info(f"Strategy 'recipient': found {len(recipient_results)}")
             output["recipient_results"] = recipient_results
 
-        # Strategy 4: Keyword extraction + subject search
+        # Strategy 4: Keyword extraction + subject/preview match
         if "keyword" in strategies:
             keywords = _extract_search_keywords(ref_info)
             if keywords:
-                namespace = getattr(session, 'outlook_namespace', None)
                 strong_keywords, weak_keywords = _split_keywords_by_strength(keywords)
                 if not strong_keywords:
                     strong_keywords = keywords[:1]
@@ -655,54 +732,28 @@ def search_related_emails(
                 ]
                 min_overlap = 2 if len(all_keywords) >= 2 else 1
 
-                for kw in strong_keywords[:3]:  # Search only with strong keywords
-                    kw_criteria = _build_search_criteria(
-                        kw, days, "subject", match_all=True
+                for info in merged_pool:
+                    eid = info.get('entry_id', '')
+                    if not eid or eid in seen_ids:
+                        continue
+                    strong_overlap = _count_keyword_overlap(info, strong_keywords)
+                    if strong_overlap < 1:
+                        continue
+                    overlap = _count_keyword_overlap(info, all_keywords)
+                    if overlap < min_overlap:
+                        continue
+                    seen_ids.add(eid)
+                    matched = dict(info)
+                    matched["_confidence"] = min(
+                        0.45
+                        + (0.10 * max(strong_overlap - 1, 0))
+                        + (0.05 * max(overlap - strong_overlap, 0)),
+                        0.70,
                     )
-                    for folder_name in ["Inbox", "Sent Items"]:
-                        try:
-                            folder = session.get_folder(folder_name)
-                            if not folder:
-                                continue
-                            items = _search_single_folder(
-                                folder,
-                                kw_criteria,
-                                max_results=50,
-                                namespace=namespace,
-                                search_type="subject",
-                            )
-                            for item in items:
-                                eid = getattr(item, 'EntryID', '')
-                                if eid and eid not in seen_ids:
-                                    info = extract_email_info(item)
-                                    if not info:
-                                        continue
-
-                                    strong_overlap = _count_keyword_overlap(
-                                        info, strong_keywords
-                                    )
-                                    if strong_overlap < 1:
-                                        continue
-
-                                    overlap = _count_keyword_overlap(
-                                        info, all_keywords
-                                    )
-                                    if overlap < min_overlap:
-                                        continue
-
-                                    seen_ids.add(eid)
-                                    info["_confidence"] = min(
-                                        0.45
-                                        + (0.10 * max(strong_overlap - 1, 0))
-                                        + (0.05 * max(overlap - strong_overlap, 0)),
-                                        0.70,
-                                    )
-                                    info["_strategy"] = f"keyword:{kw}"
-                                    info["_keyword_overlap"] = overlap
-                                    info["_strong_keyword_overlap"] = strong_overlap
-                                    keyword_results.append(info)
-                        except Exception as e:
-                            logger.warning(f"Keyword strategy error: {e}")
+                    matched["_strategy"] = f"keyword"
+                    matched["_keyword_overlap"] = overlap
+                    matched["_strong_keyword_overlap"] = strong_overlap
+                    keyword_results.append(matched)
                 logger.info(f"Strategy 'keyword': found {len(keyword_results)}")
             output["keyword_results"] = keyword_results
 
@@ -781,21 +832,9 @@ def _count_keyword_overlap(email_info: dict, keywords: List[str]) -> int:
 
 
 def _extract_search_keywords(email_info: dict) -> List[str]:
-    """Extract high-signal keywords from email subject for related search."""
-    keywords = []
-    subject = email_info.get("subject", "")
-
-    # Remove common prefixes and bracketed tags like [EXTERNAL]
-    cleaned = subject
-    for prefix in ["RE:", "Re:", "FW:", "Fwd:", "FWD:"]:
-        cleaned = cleaned.replace(prefix, "")
-
+    """Extract high-signal keywords from email subject and body for related search."""
     import re
 
-    cleaned = re.sub(r"\[[^\]]+\]", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    # Drop generic words that create noisy global matches.
     common_words = {
         "the", "and", "for", "from", "this", "that", "with", "have",
         "your", "you", "are", "not", "was", "all", "can", "has",
@@ -808,21 +847,40 @@ def _extract_search_keywords(email_info: dict) -> List[str]:
         "instructor", "instructed", "learnquest", "learn", "quest", "ibm",
     }
 
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-\.#]*", cleaned)
-    for word in words:
-        normalized = word.strip("._-#").lower()
-        if not normalized:
-            continue
-        if normalized in common_words:
-            continue
-        if normalized.isdigit() and len(normalized) <= 4:
-            # Bare years like 2026 are usually too broad as keyword seeds.
-            continue
-        if len(normalized) <= 2 and not normalized.isupper():
-            continue
-        keywords.append(normalized)
+    def _clean_and_extract(text: str) -> List[str]:
+        cleaned = text
+        for prefix in ["RE:", "Re:", "FW:", "Fwd:", "FWD:"]:
+            cleaned = cleaned.replace(prefix, "")
+        cleaned = re.sub(r"\[[^\]]+\]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
-    # Prefer more specific keywords first.
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-\.#]*", cleaned)
+        result = []
+        for word in words:
+            normalized = word.strip("._-#").lower()
+            if not normalized:
+                continue
+            if normalized in common_words:
+                continue
+            if normalized.isdigit() and len(normalized) <= 4:
+                continue
+            if len(normalized) <= 2 and not normalized.isupper():
+                continue
+            result.append(normalized)
+        return result
+
+    # Extract from subject (primary source)
+    keywords = _clean_and_extract(email_info.get("subject", ""))
+
+    # Extract from body text if available (secondary source)
+    body_text = email_info.get("_body_text", "")
+    if body_text:
+        body_keywords = _clean_and_extract(body_text)
+        for bk in body_keywords:
+            if bk not in keywords:
+                keywords.append(bk)
+
+    # Deduplicate preserving order, prefer more specific keywords first.
     keywords = list(dict.fromkeys(keywords))
     keywords.sort(
         key=lambda kw: (

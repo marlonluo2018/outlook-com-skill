@@ -184,6 +184,10 @@ class SearchConfig:
     RELATED_SEARCH_DAYS = 90  # Default lookback for find-related
     THREAD_SEARCH_DAYS = 365  # Thread search covers full history
     BODY_SEARCH_MAX_CHARS = 2000  # Max characters to read from Body in manual fallback scan
+    BODY_KEYWORD_EXTRACT_CHARS = 500  # First N chars of body for keyword extraction in find-related
+    RELATED_MAX_RESULTS = 20  # Default max results for find-related
+    FUZZY_SUBJECT_SIMILARITY_THRESHOLD = 0.60  # Token overlap threshold for fuzzy thread matching
+    FUZZY_TIME_PROXIMITY_DAYS = 7  # +/- days for fuzzy time window
 
 
 

@@ -23,6 +23,8 @@ from .search_common import (
     is_server_search_supported,
 )
 from .server_search import (
+    _fuzzy_subject_match,
+    _search_by_conversation_id_in_session,
     multi_folder_search,
     search_by_conversation_id,
     search_related_emails,
@@ -196,7 +198,9 @@ def unified_search(
 
 
 def find_thread_by_email_id(
-    email_id: str, folder_names: Optional[List[str]] = None
+    email_id: str,
+    folder_names: Optional[List[str]] = None,
+    fuzzy: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     Find all emails in the same conversation thread as the given email.
@@ -207,6 +211,7 @@ def find_thread_by_email_id(
     Args:
         email_id: EntryID of the reference email
         folder_names: Folders to search (default: Inbox + Sent Items)
+        fuzzy: If True, also find emails with similar subjects (token overlap)
 
     Returns:
         Tuple of (list of email dictionaries, status message)
@@ -219,7 +224,6 @@ def find_thread_by_email_id(
 
     try:
         with OutlookSessionManager() as session:
-            # Get the reference email to find its conversation ID
             try:
                 ref_item = session.outlook_namespace.GetItemFromID(email_id)
             except Exception as e:
@@ -227,29 +231,45 @@ def find_thread_by_email_id(
 
             conv_id = getattr(ref_item, 'ConversationID', '')
             if not conv_id:
-                return [], (
-                    "This email has no conversation ID "
-                    "(may be a standalone message)"
-                )
+                if not fuzzy:
+                    return [], (
+                        "This email has no conversation ID "
+                        "(may be a standalone message). Try --fuzzy."
+                    )
+            conv_id = str(conv_id) if conv_id else ""
 
-            conv_id = str(conv_id)
             logger.info(
                 f"Finding thread for conversation: {conv_id[:40]}..."
             )
 
-        # Search for all emails with this conversation ID
-        # search_by_conversation_id now returns dicts (extracted inside session)
-        email_list = search_by_conversation_id(conv_id, folder_names)
+            # Single session: search by ConversationID
+            email_list = []
+            seen_ids = {email_id}
+            if conv_id:
+                email_list = _search_by_conversation_id_in_session(
+                    session, conv_id, folder_names
+                )
+                for e in email_list:
+                    seen_ids.add(e.get('entry_id', ''))
+
+            # Fuzzy fallback: token-overlap subject matching
+            fuzzy_results = []
+            if fuzzy:
+                ref_info = extract_email_info(ref_item)
+                fuzzy_results = _fuzzy_subject_match(
+                    session, ref_info, folder_names, seen_ids
+                )
+                email_list.extend(fuzzy_results)
 
         if not email_list:
             return [], "No other emails found in this thread"
 
-        # Sort by received time (oldest first for thread view)
         email_list.sort(key=lambda x: x.get("received_time", ""))
 
-        return email_list, (
-            f"Found {len(email_list)} emails in conversation thread"
-        )
+        msg = f"Found {len(email_list)} emails in conversation thread"
+        if fuzzy_results:
+            msg += f" ({len(fuzzy_results)} via fuzzy match)"
+        return email_list, msg
 
     except Exception as e:
         error_msg = f"Error finding thread: {e}"
@@ -262,6 +282,7 @@ def find_related_emails(
     days: int = 90,
     strategies: Optional[List[str]] = None,
     exclude_thread: bool = False,
+    max_results: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """
     Find emails related to the given email using multiple strategies.
@@ -277,6 +298,7 @@ def find_related_emails(
         days: Lookback days for sender, recipient, and keyword strategies
         strategies: Which strategies to use (default: all)
         exclude_thread: If True, skip the thread strategy
+        max_results: Maximum results to return (default from config)
 
     Returns:
         Tuple of (list of email dicts sorted by relevance, status message)
@@ -286,6 +308,8 @@ def find_related_emails(
 
     if days > search_config.MAX_SEARCH_DAYS:
         days = search_config.MAX_SEARCH_DAYS
+
+    effective_max = max_results if max_results else search_config.RELATED_MAX_RESULTS
 
     try:
         result = search_related_emails(email_id, days, strategies, exclude_thread=exclude_thread)
@@ -297,6 +321,9 @@ def find_related_emails(
             return [], (
                 f"No related emails found for '{ref_subject}'"
             )
+
+        # Apply max_results limit
+        truncated = combined[:effective_max]
 
         ref_info = result.get("reference_email", {})
         thread_count = len(result.get("thread_results", []))
@@ -315,10 +342,14 @@ def find_related_emails(
             strategy_parts.append(f"{keyword_count} by keyword")
 
         ref_subject = ref_info.get("subject", "Unknown")
-        return combined, (
+        msg = (
             f"Found {len(combined)} related emails for '{ref_subject}' "
             f"({', '.join(strategy_parts)})"
         )
+        if len(combined) > effective_max:
+            msg += f" — showing top {effective_max}"
+
+        return truncated, msg
 
     except Exception as e:
         error_msg = f"Error finding related emails: {e}"

@@ -53,31 +53,39 @@ py -3 scripts/outlook_skill.py find --type subject --query "Name" --days 14
 ### Find Thread
 ```bash
 py -3 scripts/outlook_skill.py find-thread "<email_id>"
+py -3 scripts/outlook_skill.py find-thread "<email_id>" --fuzzy
+py -3 scripts/outlook_skill.py find-thread "<email_id>" --brief
 ```
 - **Auto-searches Inbox + Sent Items** — thread completeness requires both
 - Finds ALL emails sharing the same ConversationID
 - Subjects can differ (RE:/Fwd: prefixes, topic changes don't matter)
-- Uses a reliable full-folder scan path for conversation matching when Outlook filtering is inconsistent
+- Uses Restrict first for speed, falls back to full-folder scan when needed
+- `--fuzzy`: Also find emails with similar subjects (token overlap ≥ 0.6) when ConversationID breaks
+- `--brief`: Compact single-line output (still shows email ID)
 - Results sorted chronologically (oldest first)
+- Shows thread summary: message count, participants, date span
 
 ### Find Related Emails
 ```bash
 py -3 scripts/outlook_skill.py find-related "<email_id>"
 py -3 scripts/outlook_skill.py find-related "<email_id>" --exclude-thread
 py -3 scripts/outlook_skill.py find-related "<email_id>" --strategies recipient,keyword
+py -3 scripts/outlook_skill.py find-related "<email_id>" --max 10 --brief
 ```
-- **Auto-searches Inbox + Sent Items** — multi-strategy needs full data
+- **Auto-searches Inbox + Sent Items** — single merged scan per folder (fast)
 - Output includes relevance stars (★) and strategy name per result
 - Multi-strategy search for emails related to a given email:
   - **thread** (★5): Same ConversationID
   - **sender** (★3-4): Same sender within time window + topic keyword overlap
   - **recipient** (★3): Shared recipients (≥2 people overlap in To/CC)
-  - **keyword** (★2-3): Shared meaningful topic keywords from subject
+  - **keyword** (★2-3): Shared meaningful topic keywords from subject + body
 - Generic noise terms such as external/training/request are intentionally ignored during keyword extraction
 - Sender and keyword matching are intentionally tighter to reduce unrelated same-sender and boilerplate matches
 - Results sorted by confidence then time (newest first within same confidence)
 - `--strategies`: comma-separated (default: all four)
 - `--exclude-thread`: skip thread strategy (useful after `find-thread` to avoid duplicates)
+- `--max N`: Limit results returned (default: 20, configurable in config.py)
+- `--brief`: Compact single-line output (still shows email ID)
 
 ### Contact Lookup (Use Before Search by Email)
 ```bash

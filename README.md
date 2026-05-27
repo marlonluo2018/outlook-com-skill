@@ -9,10 +9,13 @@ This is a **universal skill module** that can be integrated with any AI assistan
 ## Key Features
 
 - Email Search: Search by subject, sender, recipient, or body content
-- Email Operations: Compose, reply, forward, move, and delete emails
+- Thread Tracking: Find all emails in the same conversation (even when subject changes)
+- Related Email Discovery: Multi-strategy search by sender, recipients, keywords
+- Email Operations: Compose, reply, forward, redirect, move, and delete emails
 - Batch Operations: Forward emails to multiple recipients via CSV
 - Folder Management: Create, list, and manage Outlook folders
-- Contact Lookup: Retrieve contact information by email address
+- Contact Lookup: Retrieve contact information by email or display name
+- Attachment Download: Save attachments to local directory
 - HTML Email Support: All emails use HTML format for rich content
 
 ## Requirements
@@ -25,6 +28,7 @@ This is a **universal skill module** that can be integrated with any AI assistan
 ## Installation
 
 Install Python dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -46,84 +50,223 @@ The skill provides CLI interface and programmatic API for flexible integration.
 All commands are executed through the CLI script located at scripts/outlook_skill.py
 
 Basic command structure:
+
 ```bash
 py -3 scripts/outlook_skill.py <command> [options]
 ```
 
-### List Recent Emails
+### Find Recent Emails
 
 ```bash
-py -3 scripts/outlook_skill.py list-recent --days 7 --folder "Inbox"
+py -3 scripts/outlook_skill.py find-recent --days 7
+py -3 scripts/outlook_skill.py find-recent --days 7 --folder "Inbox"
 ```
 
 Options:
-- --days: Number of days to look back (1-30, default: 7)
-- --folder: Folder name (default: Inbox)
 
-Output includes message ID, subject, sender, recipients, attachments, and body preview.
+- --days: Number of days to look back (1-365, default: 7)
+- --folder: Single folder override (default: Inbox + Sent Items)
 
-### Search Emails
+Output includes email ID, subject, sender, recipients, attachments, folder indicator, and body preview.
+
+### Find Emails (Search)
 
 ```bash
-py -3 scripts/outlook_skill.py search --type subject --query "Meeting" --days 30
-py -3 scripts/outlook_skill.py search --type sender --query "John Smith" --days 30
-py -3 scripts/outlook_skill.py search --type recipient --query "Jane Doe" --days 30
-py -3 scripts/outlook_skill.py search --type body --query "project update" --days 30
+py -3 scripts/outlook_skill.py find --type subject --query "Meeting" --days 14
+py -3 scripts/outlook_skill.py find --type sender --query "John Smith" --days 14
+py -3 scripts/outlook_skill.py find --type recipient --query "Jane Doe" --days 14
+py -3 scripts/outlook_skill.py find --type body --query "project update" --days 14
 ```
 
 Options:
-- --type: Search type (subject, sender, recipient, body)
-- --query: Search term (required)
-- --days: Days to look back (1-30, default: 30)
-- --folder: Folder to search (default: Inbox)
+
+- --type: Search type (subject, sender, recipient, body) — required
+- --query: Search term — required
+- --days: Days to look back (1-365, default: 14)
+- --folder: Single folder override
+- --folders: Comma-separated folder names for cross-folder search
 - --match-all: Match all terms with AND logic (default: true)
+
+Default folder behavior by search type:
+
+- `subject` / `body` → Inbox + Sent Items (both folders)
+- `sender` → Inbox only
+- `recipient` → Sent Items only
+
+### Find Thread (Conversation Tracking)
+
+Given an email, find all emails in the same conversation — even if subjects changed (RE:/FW: prefixes, topic drift).
+
+```bash
+py -3 scripts/outlook_skill.py find-thread "<email_id>"
+py -3 scripts/outlook_skill.py find-thread "<email_id>" --fuzzy
+py -3 scripts/outlook_skill.py find-thread "<email_id>" --brief
+```
+
+Options:
+
+- --folders: Override search folders (default: Inbox + Sent Items)
+- --fuzzy: Also find emails with similar subjects when conversation ID breaks (e.g., cross-tenant forwards)
+- --brief: Compact single-line output (still shows email ID)
+
+Output includes a thread summary: message count, participants, and date span.
+
+**How it works:**
+
+1. Reads the conversation ID from the given email (Outlook assigns the same ID to all replies in a thread)
+2. Searches Inbox + Sent Items for all emails with that same conversation ID
+3. With `--fuzzy`: also finds emails where subject keywords overlap ≥ 60% within ±7 days (catches broken threads)
+4. Results sorted chronologically (oldest first)
+
+### Find Related Emails (Multi-Strategy Discovery)
+
+Given an email, find all related emails across multiple dimensions — not just the same thread, but same sender, same group of people, or same topic.
+
+```bash
+py -3 scripts/outlook_skill.py find-related "<email_id>"
+py -3 scripts/outlook_skill.py find-related "<email_id>" --exclude-thread
+py -3 scripts/outlook_skill.py find-related "<email_id>" --strategies sender,keyword
+py -3 scripts/outlook_skill.py find-related "<email_id>" --max 10 --brief
+```
+
+Options:
+
+- --days: Lookback window for sender/recipient/keyword strategies (default: 90)
+- --strategies: Comma-separated list (default: all four — thread, sender, recipient, keyword)
+- --exclude-thread: Skip thread strategy (useful after find-thread to avoid duplicates)
+- --max: Limit results returned (default: 20, configurable in config.py)
+- --brief: Compact single-line output (still shows email ID)
+
+**How it works — 4 strategies ranked by relevance:**
+
+| Strategy  | What it finds                                           | Relevance |
+| --------- | ------------------------------------------------------- | --------- |
+| thread    | Same conversation ID                                    | ★★★★★     |
+| sender    | Same sender + overlapping topic keywords                | ★★★★      |
+| recipient | ≥ 2 shared recipients in To/CC (same group discussing)  | ★★★       |
+| keyword   | Shared meaningful keywords from subject + body          | ★★★       |
+
+Results are merged, deduplicated, and sorted by relevance then time.
+
+**Performance:** Uses a single merged scan per folder (not separate scans per strategy), so it's fast even with all 4 strategies enabled.
 
 ### Contact Lookup
 
 ```bash
 py -3 scripts/outlook_skill.py lookup-contact "user@example.com"
+py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 ```
+
+Accepts email address or display name. Auto-detects format by presence of `@`.
+
+Returns: Display name, email, alias, company, department, job title, office, phone, mobile, location.
 
 Why use this? Outlook MAPI doesn't reliably search by email address. Use this to get the display name, then search by name.
 
-Workflow:
-1. Lookup contact to get display name
-2. Search by name instead of email address
-
-### Reply to Email
+### Get Full Email Details
 
 ```bash
-py -3 scripts/outlook_skill.py reply "<message_id>" "<p>Your HTML reply</p>"
-py -3 scripts/outlook_skill.py reply "<message_id>" "<p>Your HTML reply</p>" --send
-py -3 scripts/outlook_skill.py reply "<message_id>" "<p>Your HTML reply</p>" --to "user1@example.com" --send
+py -3 scripts/outlook_skill.py get-email "<email_id>"
 ```
 
+Returns complete email content: full HTML body, all attachments, metadata. Embedded images are auto-extracted to a temp directory with paths printed in output.
+
+### ReplyAll (Default Reply)
+
+```bash
+py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>"
+py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --cc "extra@example.com"
+py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --attach "C:\path\file.pdf"
+```
+
+Keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
+
 Options:
-- --send: Actually send the email (default: preview only)
-- --to: Override To recipients (comma-separated)
-- --cc: Override CC recipients (comma-separated)
+
+- --to: Additional To recipients (comma separated)
+- --cc: Additional CC recipients (comma separated)
+- --attach: File path(s) to attach (comma separated for multiple)
+- --inline-image: Embed image inline (format: `filepath:cid_name`, comma separated)
+
+### Reply (Sender Only)
+
+```bash
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>"
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>" --to "specific@example.com"
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>" --attach "C:\path\file.pdf"
+```
+
+Replies to sender only. `--to`/`--cc` specify EXACT extra recipients (original To/CC NOT included).
+
+Options:
+
+- --to: Extra To recipients (comma separated)
+- --cc: Extra CC recipients (comma separated)
+- --attach: File path(s) to attach (comma separated)
+- --inline-image: Embed image inline (format: `filepath:cid_name`, comma separated)
 
 ### Compose New Email
 
 ```bash
-py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Meeting" --body "<p>Hello,</p><p>Let's meet tomorrow.</p>"
+py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Meeting" --body "<p>Hello</p>"
+py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Report" --body "<p>See attached</p>" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Photo" --body "<p><img src='cid:pic1'></p>" --inline-image "C:\path\img.png:pic1"
 ```
 
 Options:
+
 - --to: To recipients (comma-separated, required)
 - --subject: Email subject (required)
 - --body: Email body in HTML format (required)
-- --cc: CC recipients (comma-separated, optional)
+- --cc: CC recipients (comma-separated)
+- --attach: File path(s) to attach (comma separated)
+- --inline-image: Embed image inline (format: `filepath:cid_name`, comma separated)
 
-Note: Compose always sends immediately (no preview mode).
+Sends immediately when called.
+
+### Forward (Single)
+
+```bash
+py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@example.com"
+py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@example.com,user2@example.com" --cc "manager@example.com" --body "<p>FYI</p>"
+py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@example.com" --attach "C:\path\extra.pdf"
+```
+
+Options:
+
+- --to: To recipients (comma-separated, required)
+- --cc: CC recipients (comma-separated)
+- --body: Custom HTML message to prepend
+- --attach: Additional file path(s) to attach (comma separated)
+- --inline-image: Embed image inline (format: `filepath:cid_name`, comma separated)
+
+Preserves original email formatting. Subject auto-prefixed with `FW:`.
+
+### Redirect (Clear Recipients + New TO/CC)
+
+```bash
+py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>New message</p>" --to "a@example.com,b@example.com"
+py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>FYI</p>" --to "a@example.com" --cc "b@example.com"
+```
+
+Clears all existing TO and CC recipients, then adds new ones. Preserves original email body as quoted content.
+
+Options:
+
+- body: HTML message prepended above original content (required)
+- --to: New TO recipients (comma separated, required)
+- --cc: New CC recipients (comma separated)
+- --attach: File path(s) to attach (comma separated)
+- --inline-image: Embed image inline (format: `filepath:cid_name`, comma separated)
 
 ### Batch Forward
 
 ```bash
-py -3 scripts/outlook_skill.py batch-forward "<message_id>" "recipients.csv" --message "FYI"
+py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --message "<p>FYI</p>"
 ```
 
-CSV Format:
+CSV Format (single column named "email", supports BOM encoding):
+
 ```csv
 email
 user1@example.com
@@ -132,14 +275,42 @@ user3@example.com
 ```
 
 Features:
+
 - Uses BCC for privacy (recipients don't see each other)
-- Automatically batches in groups of 500 (Outlook limit)
-- Optional custom message prepended to forwarded content
+- Automatically splits into batches of 500 (configurable in config.py)
+- Optional HTML message prepended to forwarded content
+
+### Download Attachment
+
+```bash
+py -3 scripts/outlook_skill.py download-attachment "<email_id>"
+py -3 scripts/outlook_skill.py download-attachment "<email_id>" --output-dir "C:\temp"
+py -3 scripts/outlook_skill.py download-attachment "<email_id>" --filename "report.pdf"
+```
+
+Options:
+
+- --output-dir: Directory to save attachments (default: ~/Downloads)
+- --filename: Download only a specific attachment by name
+- --all: Include embedded images (default: skips inline images, keeps PDFs/docs)
+
+### Inline Images
+
+Embed images directly in email body using Content-ID (CID):
+
+```bash
+py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Report" \
+  --body "<p>See chart: <img src='cid:chart1'></p>" \
+  --inline-image "C:\path\chart.png:chart1"
+```
+
+- Format: `filepath:cid_name` (comma separated for multiple)
+- Reference in HTML: `<img src="cid:cid_name">`
+- Works with: compose, reply, replyall, forward, redirect
 
 ### Folder Management
 
 ```bash
-py -3 scripts/outlook_skill.py list-folders
 py -3 scripts/outlook_skill.py create-folder "ProjectX" --parent "Inbox"
 py -3 scripts/outlook_skill.py remove-folder "ProjectX"
 ```
@@ -147,41 +318,40 @@ py -3 scripts/outlook_skill.py remove-folder "ProjectX"
 ### Email Management
 
 ```bash
-py -3 scripts/outlook_skill.py move-email "<message_id>" "Archive"
-py -3 scripts/outlook_skill.py delete-email "<message_id>"
-py -3 scripts/outlook_skill.py get-email "<message_id>"
+py -3 scripts/outlook_skill.py move-email "<email_id>" "Archive"
+py -3 scripts/outlook_skill.py delete-email "<email_id>"
 ```
 
 ## Architecture
 
 ### Project Structure
 
-```
+```text
 outlook-skill/
-├── backend/                      
-│   ├── email_search/            
-│   │   ├── unified_search.py    
-│   │   ├── server_search.py     
-│   │   ├── subject_search.py    
-│   │   ├── sender_search.py     
-│   │   ├── recipient_search.py  
-│   │   └── body_search.py       
-│   ├── outlook_session/         
-│   │   ├── session_manager.py   
-│   │   ├── email_operations.py  
-│   │   ├── folder_operations.py 
-│   │   └── contact_operations.py
-│   ├── config.py                
-│   ├── validation.py            
-│   └── email_composition.py     
-├── tools/
-│   ├── search_tools.py
-│   ├── email_operations.py
-│   ├── folder_tools.py
-│   ├── batch_operations.py
-│   └── viewing_tools.py
+├── backend/
+│   ├── email_search/
+│   │   ├── unified_search.py     # Public search API (find, find-thread, find-related)
+│   │   ├── server_search.py      # Core search engine (Restrict, merged scan, strategies)
+│   │   ├── search_common.py      # Shared utilities (extract_email_info, folder helpers)
+│   │   ├── email_listing.py      # Recent email listing
+│   │   ├── parallel_extractor.py # Parallel email data extraction
+│   │   ├── subject_search.py
+│   │   ├── sender_search.py
+│   │   ├── recipient_search.py
+│   │   └── body_search.py
+│   ├── outlook_session/
+│   │   ├── session_manager.py    # COM session lifecycle (context manager)
+│   │   ├── email_operations.py   # Send, reply, forward operations
+│   │   ├── folder_operations.py  # Folder CRUD
+│   │   └── contact_operations.py # Contact/GAL lookup
+│   ├── config.py                 # All configuration constants
+│   ├── validation.py             # Input validation
+│   ├── email_composition.py      # Email building helpers
+│   └── logging_config.py         # Logging setup
 ├── scripts/
-│   └── outlook_skill.py         
+│   └── outlook_skill.py          # CLI entry point
+├── SKILL.md                      # Quick reference (AI-oriented)
+├── README.md                     # Full documentation
 └── requirements.txt
 ```
 
@@ -206,13 +376,14 @@ outlook-skill/
 All email bodies must be in HTML format.
 
 Simple Email:
+
 ```html
 <p>Hello,</p>
 <p>This is a simple message.</p>
-<p>Best regards,<br>Your Name</p>
 ```
 
 Formatted Email:
+
 ```html
 <p>Dear Team,</p>
 <p>Please review the following:</p>
@@ -220,8 +391,19 @@ Formatted Email:
   <li><strong>Item 1</strong>: Description</li>
   <li><strong>Item 2</strong>: Description</li>
 </ul>
-<p>Thank you,<br>Manager</p>
 ```
+
+**Special characters:** Replace `$` with `&#36;` in HTML body to avoid shell variable interpolation.
+
+```html
+<!-- Wrong: $80,000 becomes ,000 -->
+<p>Cost: $80,000 USD</p>
+
+<!-- Correct: use HTML entity -->
+<p>Cost: &#36;80,000 USD</p>
+```
+
+Common entities: `$` = `&#36;` | `&` = `&amp;` | `<` = `&lt;` | `>` = `&gt;`
 
 ## Search Tips
 
@@ -229,26 +411,46 @@ Formatted Email:
 
 Outlook MAPI doesn't reliably search by email address. Use this workflow:
 
-1. Lookup contact first to get display name
-2. Use display name in search
+1. `lookup-contact "user@example.com"` → get display name
+2. `find --type sender --query "Display Name"` → search by name
 
 ### Search Performance
 
-- Subject/Sender/Recipient: Fast (server-side search)
-- Body content: Slower (requires loading full email content)
-- Limit days: Use smaller day ranges for faster results
+- Subject/Sender/Recipient: Fast (server-side Restrict filter)
+- Body content: Uses subject pre-filter first, then validates body match (configurable read limit)
+- find-related: Single merged scan per folder for all strategies
+- find-thread: Tries Restrict first, falls back to manual scan
 
 ### Match Logic
 
 - --match-all true (default): Requires ALL terms to match (AND logic)
 - --match-all false: Matches ANY term (OR logic)
 
+### Recommended Search Workflow
+
+```bash
+# 1. Start narrow and recent
+py -3 scripts/outlook_skill.py find --type subject --query "topic" --days 14
+
+# 2. If not found, widen time window
+py -3 scripts/outlook_skill.py find --type subject --query "topic" --days 45
+
+# 3. From any result, find the full conversation thread
+py -3 scripts/outlook_skill.py find-thread "<email_id>"
+
+# 4. For broader context, find related emails across threads
+py -3 scripts/outlook_skill.py find-related "<email_id>"
+```
+
 ## Configuration
 
-Configuration is centralized in backend/config.py:
+Configuration is centralized in `backend/config.py`:
 
-- Search limits: Max 30 days lookback
-- Batch sizes: Optimized for performance
+- Search limits: Max 365 days lookback, default 14 days for direct find
+- Related search: Max results (default: 20), lookback (default: 90 days)
+- Fuzzy matching: Subject similarity threshold (0.60), time proximity (±7 days)
+- Body keyword extraction: First 500 chars for keyword strategy
+- Batch sizes: BCC limit (500), extraction batch sizes
 - Display settings: Text truncation, date formats
 - Outlook constants: COM object types and folder IDs
 
@@ -313,17 +515,18 @@ Each email returned contains:
 
 ## Performance
 
-- Fast Search: 100 emails loaded in approximately 2 seconds
-- Real-time: Searches complete instantly
-- Batch Operations: Forward to 100+ recipients in 2 minutes
-- Local Processing: No network latency
+- Server-side search: Uses Outlook Restrict filter (near-instant for subject/sender/recipient)
+- Merged scan: find-related scans each folder once for all strategies (not per-strategy)
+- find-thread: Tries Restrict first, falls back to manual scan only when needed
+- Body search: Subject pre-filter reduces emails needing full body read
+- Batch operations: Forward to 500+ recipients per batch via BCC
+- Local processing: All operations via COM, no network latency
 
 ## Related Files
 
-- SKILL.md - Quick reference guide
-- scripts/outlook_skill.py - Main CLI implementation
-- backend/config.py - Configuration settings
-- tools/ - API wrapper functions for programmatic access
+- SKILL.md — Quick reference for AI integration (triggers, operations, format rules)
+- scripts/outlook_skill.py — CLI entry point (all commands)
+- backend/config.py — Centralized configuration (all tunable parameters)
 
 ## Contributing
 

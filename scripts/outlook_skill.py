@@ -259,6 +259,62 @@ def _display_email_list(emails, show_folder=True):
         print()
 
 
+def _print_thread_summary(emails):
+    """Print a one-line thread summary: count, participants, date span."""
+    if not emails:
+        return
+    senders = list(dict.fromkeys(e.get('sender', 'Unknown') for e in emails))
+    times = [e.get('received_time', '') for e in emails if e.get('received_time')]
+    times.sort()
+
+    participant_str = ", ".join(senders[:3])
+    if len(senders) > 3:
+        participant_str += f" +{len(senders) - 3} more"
+
+    span_str = ""
+    if len(times) >= 2:
+        start = times[0][:10]
+        end = times[-1][:10]
+        if start != end:
+            try:
+                from datetime import datetime
+                d1 = datetime.strptime(start, "%Y-%m-%d")
+                d2 = datetime.strptime(end, "%Y-%m-%d")
+                span_days = (d2 - d1).days
+                span_str = f" | Span: {start} → {end} ({span_days} days)"
+            except Exception:
+                span_str = f" | Span: {start} → {end}"
+        else:
+            span_str = f" | Date: {start}"
+    elif times:
+        span_str = f" | Date: {times[0][:10]}"
+
+    print(f"\U0001F4CA Thread: {len(emails)} messages | Participants: {participant_str}{span_str}")
+    print()
+
+
+def _display_email_list_brief(emails, show_folder=True):
+    """Compact single-line display with email ID on second line."""
+    for idx, email_data in enumerate(emails, 1):
+        email_id = email_data.get('id') or email_data.get('entry_id', '')
+        folder_name = email_data.get('folder', '')
+        folder_tag = f" {_folder_emoji(folder_name)}" if show_folder and folder_name else ""
+
+        received = (email_data.get('received_time', '') or '')[:10]
+        sender = (email_data.get('sender', 'Unknown') or 'Unknown')[:20]
+        subject = (email_data.get('subject', 'No Subject') or 'No Subject')[:50]
+
+        confidence = email_data.get('_confidence')
+        strategy = email_data.get('_strategy', '')
+        stars_str = ""
+        if confidence is not None:
+            stars = "★" * int(confidence * 5) + "☆" * (5 - int(confidence * 5))
+            stars_str = f" {stars}"
+
+        print(f"# {idx}{folder_tag} {received} | {sender:<20} | {subject}{stars_str}")
+        print(f"  ID: {email_id}")
+
+
 def cmd_search(args):
     """Search emails and display with IDs - supports multi-folder."""
     try:
@@ -933,11 +989,16 @@ def cmd_find_thread(args):
                 [f.strip() for f in args.folders.split(',')]
                 if args.folders else None
             ),
+            fuzzy=getattr(args, 'fuzzy', False),
         )
-        print(f"\n🧵 {message}\n")
+        print(f"\n\U0001F9F5 {message}\n")
 
         if emails:
-            _display_email_list(emails, show_folder=True)
+            _print_thread_summary(emails)
+            if getattr(args, 'brief', False):
+                _display_email_list_brief(emails, show_folder=True)
+            else:
+                _display_email_list(emails, show_folder=True)
 
         return 0
     except Exception as e:
@@ -1009,11 +1070,15 @@ def cmd_find_related(args):
             days=args.days,
             strategies=strategies,
             exclude_thread=args.exclude_thread,
+            max_results=getattr(args, 'max_results', None),
         )
-        print(f"\n🔗 {message}\n")
+        print(f"\n\U0001F517 {message}\n")
 
         if emails:
-            _display_email_list(emails, show_folder=True)
+            if getattr(args, 'brief', False):
+                _display_email_list_brief(emails, show_folder=True)
+            else:
+                _display_email_list(emails, show_folder=True)
 
         return 0
     except Exception as e:
@@ -1148,6 +1213,8 @@ def main():
     parser_thread = subparsers.add_parser('find-thread', help='Find all emails in same conversation thread')
     parser_thread.add_argument('email_id', help='Email ID from search results')
     parser_thread.add_argument('--folders', type=str, default=None, help='Folders to search (default: Inbox,Sent Items)')
+    parser_thread.add_argument('--fuzzy', action='store_true', help='Also find emails with similar subjects (token overlap)')
+    parser_thread.add_argument('--brief', action='store_true', help='Compact single-line output')
     parser_thread.set_defaults(func=cmd_find_thread)
 
     # Find related command
@@ -1156,6 +1223,8 @@ def main():
     parser_related.add_argument('--days', type=int, default=90, help='Days back for sender/keyword strategies')
     parser_related.add_argument('--strategies', type=str, default=None, help='Strategies: thread,sender,recipient,keyword (default: all)')
     parser_related.add_argument('--exclude-thread', action='store_true', help='Skip thread strategy (useful after find-thread)')
+    parser_related.add_argument('--max', type=int, dest='max_results', default=None, help='Maximum results to return (default: from config)')
+    parser_related.add_argument('--brief', action='store_true', help='Compact single-line output')
     parser_related.set_defaults(func=cmd_find_related)
 
     # Download attachment command
