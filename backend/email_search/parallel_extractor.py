@@ -52,7 +52,7 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
             "entry_id": entry_id,
             "subject": subject,
             "sender": sender,
-            "received_time": str(received_time) if received_time else "Unknown",
+            "received_time": str(received_time.replace(tzinfo=None)) if received_time else "Unknown",
             "to_recipients": to_recipients,
             "cc_recipients": cc_recipients,
             "has_attachments": has_attachments,
@@ -232,7 +232,7 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
             sender = getattr(item, 'SenderName', 'Unknown') or 'Unknown'
             
             received_time = getattr(item, 'ReceivedTime', None)
-            received_str = str(received_time) if received_time else "Unknown"
+            received_str = str(received_time.replace(tzinfo=None)) if received_time else "Unknown"
             
             # Extract recipient information
             to_field = getattr(item, 'To', '')

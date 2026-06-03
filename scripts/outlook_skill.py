@@ -366,7 +366,8 @@ def cmd_get_email(args):
                 print(f"To: {email_item.To}")
             if email_item.CC:
                 print(f"CC: {email_item.CC}")
-            print(f"Date: {email_item.ReceivedTime}")
+            rt = getattr(email_item, 'ReceivedTime', None)
+            print(f"Date: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
             print(f"\nBody:\n{email_item.Body}")
 
             if email_item.Attachments.Count > 0:
@@ -390,8 +391,17 @@ def cmd_get_email(args):
                     temp_dir = os.path.join(tempfile.gettempdir(), "outlook_inline", args.email_id[:16])
                     os.makedirs(temp_dir, exist_ok=True)
                     print(f"\n\U0001F5BC  Embedded images (auto-saved):")
+                    used_names = set()
                     for attach in embedded:
-                        save_path = os.path.join(temp_dir, attach.FileName)
+                        filename = attach.FileName
+                        if filename in used_names:
+                            stem, ext = os.path.splitext(filename)
+                            counter = 2
+                            while f"{stem}_{counter}{ext}" in used_names:
+                                counter += 1
+                            filename = f"{stem}_{counter}{ext}"
+                        used_names.add(filename)
+                        save_path = os.path.join(temp_dir, filename)
                         attach.SaveAsFile(save_path)
                         size_kb = attach.Size / 1024
                         print(f"  - {save_path} ({size_kb:.1f} KB)")
@@ -451,6 +461,10 @@ def _add_attachments(mail_item, attach_str):
 def _add_inline_images(mail_item, inline_str):
     """Embed images into the HTML body using CID.
 
+    Format: "filepath:cid_name" (comma separated for multiple).
+    Windows paths (C:\...) are handled — only the last colon past position 1
+    is treated as the filepath:cid separator.
+
     If the body already contains cid: references for the images, only sets the
     CID property (user controls placement). Otherwise auto-prepends <img> tags.
     """
@@ -458,13 +472,20 @@ def _add_inline_images(mail_item, inline_str):
         return
     import os
     cids = []
-    for filepath in inline_str.split(","):
-        filepath = filepath.strip().strip('"')
+    for entry in inline_str.split(","):
+        entry = entry.strip().strip('"')
+        last_colon = entry.rfind(":")
+        if last_colon > 1:
+            filepath = entry[:last_colon]
+            cid = entry[last_colon + 1:]
+        else:
+            filepath = entry
+            cid = None
         if not os.path.exists(filepath):
             print(f"WARNING: Inline image not found: {filepath}")
             continue
-        filename = os.path.basename(filepath)
-        cid = filename.replace(" ", "_")
+        if not cid:
+            cid = os.path.basename(filepath).replace(" ", "_")
         attachment = mail_item.Attachments.Add(filepath)
         attachment.PropertyAccessor.SetProperty(
             "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
@@ -526,11 +547,34 @@ def _is_embedded_image(attachment):
     return False
 
 
+_FONT_STYLE = 'font-family:Calibri,sans-serif;font-size:11pt;'
+
+
+def _wrap_body_font(html_body: str) -> str:
+    """Wrap HTML body content in a div with consistent font styling."""
+    if not html_body:
+        return ""
+    return f'<div style="{_FONT_STYLE}">{html_body}</div>'
+
+
 def _format_forward_message_html(message_text: str) -> str:
     """Convert plain text or HTML-ish input into the simple prepended block used for forwards."""
     if not message_text:
         return ""
-    return '<p>' + message_text.replace('\n\n', '</p><p>').replace('\n', '<br>') + '</p>'
+    inner = '<p>' + message_text.replace('\n\n', '</p><p>').replace('\n', '<br>') + '</p>'
+    return _wrap_body_font(inner)
+
+
+def _get_smtp_address(recipient):
+    """Extract SMTP email address from an Outlook Recipient object."""
+    try:
+        if recipient.AddressEntry.Type == "EX":
+            exchange_user = recipient.AddressEntry.GetExchangeUser()
+            if exchange_user:
+                return exchange_user.PrimarySmtpAddress
+    except:
+        pass
+    return recipient.Address or recipient.Name
 
 
 def _remove_self_from_recipients(reply, current_user_email):
@@ -538,13 +582,8 @@ def _remove_self_from_recipients(reply, current_user_email):
     to_remove = []
     for i in range(1, reply.Recipients.Count + 1):
         recipient = reply.Recipients.Item(i)
-        recipient_email = recipient.Address
-        try:
-            if recipient.AddressEntry.Type == "EX":
-                recipient_email = recipient.AddressEntry.GetExchangeUser().PrimarySmtpAddress
-        except:
-            pass
-        if recipient_email.lower() == current_user_email.lower():
+        recipient_email = _get_smtp_address(recipient)
+        if recipient_email and recipient_email.lower() == current_user_email.lower():
             to_remove.append(i)
     for i in reversed(to_remove):
         reply.Recipients.Remove(i)
@@ -563,6 +602,24 @@ def _add_recipients(reply, to_str, cc_str):
             if r:
                 cc_recip = reply.Recipients.Add(r)
                 cc_recip.Type = 2
+
+
+def _build_reply_header(email_item, current_user_email):
+    """Build standard reply attribution header (From/Sent/To/Cc/Subject)."""
+    sent_on = email_item.SentOn.strftime("%A, %B %d, %Y %I:%M %p") if email_item.SentOn else ""
+    original_to = getattr(email_item, "To", "") or ""
+    original_cc = getattr(email_item, "CC", "") or ""
+    original_subject = getattr(email_item, "Subject", "") or ""
+    header = (
+        '<div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0 0 0">'
+        f'<p><b>From:</b> {email_item.SenderName} &lt;{current_user_email}&gt;<br>'
+        f'<b>Sent:</b> {sent_on}<br>'
+        f'<b>To:</b> {original_to}<br>'
+    )
+    if original_cc:
+        header += f'<b>Cc:</b> {original_cc}<br>'
+    header += f'<b>Subject:</b> {original_subject}</p></div>'
+    return header
 
 
 def cmd_replyall(args):
@@ -584,31 +641,25 @@ def cmd_replyall(args):
             is_sent_items = "Sent Items" in parent_folder.Name or "已发送邮件" in parent_folder.Name
 
             if is_sent_items:
-                # Sent Items: create new email with original recipients + extras
+                # Sent Items: create new email with original recipients using SMTP addresses
                 reply = session.outlook.CreateItem(0)
-                if email_item.To:
-                    for r in email_item.To.split(";"):
-                        r = r.strip()
-                        if r and r.lower() != current_user_email.lower():
-                            reply.Recipients.Add(r)
-                if email_item.CC:
-                    for r in email_item.CC.split(";"):
-                        r = r.strip()
-                        if r and r.lower() != current_user_email.lower():
-                            cc_recip = reply.Recipients.Add(r)
-                            cc_recip.Type = 2
+                for i in range(1, email_item.Recipients.Count + 1):
+                    recip = email_item.Recipients.Item(i)
+                    smtp = _get_smtp_address(recip)
+                    if smtp and smtp.lower() != current_user_email.lower():
+                        new_recip = reply.Recipients.Add(smtp)
+                        new_recip.Type = recip.Type  # 1=To, 2=CC
                 _add_recipients(reply, args.to, args.cc)
                 reply.Display(False)
                 signature_html = reply.HTMLBody
-                separator = '<hr style="border: 1px solid #ccc; margin: 20px 0;">'
                 original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
-                reply.HTMLBody = args.body + signature_html + separator + original_body
+                reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
             else:
                 # Inbox: ReplyAll + append
                 reply = email_item.ReplyAll()
                 _remove_self_from_recipients(reply, current_user_email)
                 _add_recipients(reply, args.to, args.cc)
-                reply.HTMLBody = args.body + reply.HTMLBody
+                reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
 
             reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
 
@@ -640,20 +691,25 @@ def cmd_reply(args):
             parent_folder = email_item.Parent
             is_sent_items = "Sent Items" in parent_folder.Name or "已发送邮件" in parent_folder.Name
 
+            current_user = session.outlook.Session.CurrentUser
+            current_user_email = (
+                current_user.AddressEntry.GetExchangeUser().PrimarySmtpAddress
+                if current_user.AddressEntry.GetExchangeUser() else ""
+            )
+
             if is_sent_items:
                 # Sent Items: new email with only specified recipients
                 reply = session.outlook.CreateItem(0)
                 _add_recipients(reply, args.to, args.cc)
                 reply.Display(False)
                 signature_html = reply.HTMLBody
-                separator = '<hr style="border: 1px solid #ccc; margin: 20px 0;">'
                 original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
-                reply.HTMLBody = args.body + signature_html + separator + original_body
+                reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
             else:
                 # Inbox: Reply (sender only) + specified extras
                 reply = email_item.Reply()
                 _add_recipients(reply, args.to, args.cc)
-                reply.HTMLBody = args.body + reply.HTMLBody
+                reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
 
             reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
 
@@ -695,7 +751,7 @@ def cmd_compose(args):
             mail.Display(False)
 
             # Prepend body to signature HTML (same pattern as reply)
-            mail.HTMLBody = args.body + mail.HTMLBody
+            mail.HTMLBody = _wrap_body_font(args.body) + mail.HTMLBody
 
             _add_inline_images(mail, args.inline_image)
             _add_attachments(mail, args.attach)
@@ -779,6 +835,10 @@ def cmd_forward(args):
 
             forward = email_item.Forward()
 
+            # Meeting items preserve original attendees as recipients — clear them
+            while forward.Recipients.Count > 0:
+                forward.Recipients.Remove(1)
+
             # Set subject with FW: prefix
             original_subject = str(getattr(email_item, "Subject", "No Subject"))
             forward.Subject = f"FW: {original_subject}" if not original_subject.startswith("FW:") else original_subject
@@ -800,7 +860,14 @@ def cmd_forward(args):
 
             # Prepend custom message if provided
             if args.body:
-                forward.HTMLBody = _format_forward_message_html(args.body) + forward.HTMLBody
+                prepend_html = _format_forward_message_html(args.body)
+                try:
+                    original_html = forward.HTMLBody
+                    forward.HTMLBody = prepend_html + original_html
+                except Exception:
+                    # Meeting items / special types need inspector initialization
+                    _ = forward.GetInspector
+                    forward.HTMLBody = prepend_html + forward.HTMLBody
 
             if forward.Recipients.Count == 0:
                 print("Error: No recipients specified. Use --to.")
@@ -850,7 +917,7 @@ def cmd_redirect(args):
             # Signature + body
             forward.Display(False)
             signature_html = forward.HTMLBody
-            forward.HTMLBody = args.body + signature_html
+            forward.HTMLBody = _wrap_body_font(args.body) + signature_html
 
             recipient_count = forward.Recipients.Count
             final_subject = forward.Subject
@@ -920,7 +987,35 @@ def cmd_delete_email(args):
             subject = email_item.Subject
             email_item.Delete()
             print(f"Successfully deleted email: {subject}")
-        
+
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
+def cmd_recall(args):
+    """Recall a sent email via Exchange server"""
+    try:
+        with OutlookSessionManager() as session:
+            email_item = _get_email_item(session, args.email_id)
+
+            if not email_item.Sent:
+                print("Error: Can only recall sent emails.", file=sys.stderr)
+                return 1
+
+            subject = email_item.Subject
+            recipients = email_item.To
+            print(f"Recalling: {subject}")
+            print(f"Recipients: {recipients}")
+
+            email_item.Display()
+            inspector = email_item.GetInspector
+            inspector.CommandBars.ExecuteMso("RecallThisMessage")
+            print(f"\n✅ Recall dialog opened for: {subject}")
+            print("Please confirm in the Outlook dialog, then close the email window.")
+            print("Note: Recall only works for internal Exchange recipients who haven't read the message.")
+
         return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -1203,7 +1298,12 @@ def main():
     parser_delete = subparsers.add_parser('delete-email', help='Delete an email by ID')
     parser_delete.add_argument('email_id', help='Email ID from search results')
     parser_delete.set_defaults(func=cmd_delete_email)
-    
+
+    # Recall email command
+    parser_recall = subparsers.add_parser('recall', help='Recall a sent email via Exchange')
+    parser_recall.add_argument('email_id', help='Email ID from search results (must be in Sent Items)')
+    parser_recall.set_defaults(func=cmd_recall)
+
     # Lookup contact command
     parser_lookup = subparsers.add_parser('lookup-contact', help='Look up contact information by email or display name')
     parser_lookup.add_argument('query', help='Email address or display name to look up')

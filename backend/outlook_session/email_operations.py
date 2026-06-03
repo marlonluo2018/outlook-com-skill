@@ -49,7 +49,7 @@ class EmailOperations:
                 "entry_id": message_id,
                 "subject": getattr(item, 'Subject', 'No Subject'),
                 "sender": getattr(item, 'SenderName', 'Unknown'),
-                "received_time": str(getattr(item, 'ReceivedTime', 'Unknown')),
+                "received_time": str(getattr(item, 'ReceivedTime').replace(tzinfo=None)) if getattr(item, 'ReceivedTime', None) else "Unknown",
                 "body": getattr(item, 'Body', ''),
             }
             

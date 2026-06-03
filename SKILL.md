@@ -14,7 +14,7 @@ triggers: [
   "download attachment", "save attachment", "get attachment",
   "lookup contact", "who is"
 ]
-operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email"]
+operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall"]
 ---
 
 # Outlook Skill
@@ -170,6 +170,18 @@ py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>FYI</p>" --to "a@b.com"
 - `--cc`: New CC recipients (comma separated)
 - `--attach`: File path(s) to attach (comma separated)
 - Use when you want to send the same email to entirely different people
+
+### Recall Sent Email
+```bash
+py -3 scripts/outlook_skill.py recall "<email_id>"
+```
+- Recalls a sent email via Exchange server (removes from recipients' inbox)
+- Email must be in Sent Items (`email_item.Sent == True`)
+- **Limitations:**
+  - Only works for recipients on the same Exchange/Microsoft 365 organization
+  - Only works if recipient hasn't read the message yet
+  - External recipients (different mail server) will still see the email
+- You will receive a "Message Recall Report" email from Exchange indicating success/failure per recipient
 
 ### Download Attachment
 ```bash
