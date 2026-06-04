@@ -12,9 +12,10 @@ triggers: [
   "batch forward", "mass forward", "forward to multiple",
   "get email", "view email", "show email details",
   "download attachment", "save attachment", "get attachment",
-  "lookup contact", "who is"
+  "lookup contact", "who is",
+  "use as template", "edit email html", "modify email", "create from template"
 ]
-operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall"]
+operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall", "get-html", "edit-html", "send-draft"]
 ---
 
 # Outlook Skill
@@ -202,6 +203,43 @@ py -3 scripts/outlook_skill.py get-email "<email_id>"
 - Returns complete email: full body, all attachments, metadata
 - Use after search/thread/related to read the actual content
 - **Embedded images:** Auto-extracted to `%TEMP%\outlook_inline\<id>\`. Paths printed in output — use Read tool to view.
+
+### Get Email HTML (Template Reading)
+```bash
+py -3 scripts/outlook_skill.py get-html "<email_id>"
+```
+- Returns the **raw HTMLBody** of an email (not plain text)
+- Use this to inspect the HTML structure before editing
+- Output wrapped in `HTML_START` / `HTML_END` markers for easy parsing
+- Shows subject, sender, recipients, and HTML character count
+
+### Edit Email HTML (Template Editing)
+```bash
+py -3 scripts/outlook_skill.py edit-html "<email_id>" --replace "old text::new text"
+py -3 scripts/outlook_skill.py edit-html "<email_id>" --replace "Q1 2025::Q2 2025" --replace "January::April"
+py -3 scripts/outlook_skill.py edit-html "<email_id>" --replace "old::new" --subject "New Subject" --to "new@ibm.com"
+py -3 scripts/outlook_skill.py edit-html "<email_id>" --body-file "C:\temp\modified.html"
+py -3 scripts/outlook_skill.py edit-html "<email_id>" --replace "old::new" --copy-attachments
+```
+- Takes a source email as template, applies modifications, saves as **new draft**
+- Original email is **never modified** — always creates a fresh draft
+- Result appears in your **Drafts folder** in Outlook
+- `--replace "old::new"`: Text/HTML replacement (repeatable, uses `::` separator)
+- `--subject`: Override subject line
+- `--to`: Override To recipients (comma separated)
+- `--cc`: Override CC recipients (comma separated)
+- `--body-file`: Replace entire HTML body from a local file
+- `--copy-attachments`: Copy file attachments from source (skips embedded images)
+- **AI workflow:** `get-html` → analyze → `edit-html` with targeted replacements
+
+### Send Draft
+```bash
+py -3 scripts/outlook_skill.py send-draft "<draft_email_id>"
+```
+- Sends an existing draft email from the Drafts folder
+- Validates: must be unsent, must have at least one recipient
+- **⚠️ ALWAYS confirm with user before calling — NEVER send without approval**
+- **AI workflow:** `edit-html` (iterate until user approves) → `send-draft`
 
 ### Sending Inline Images
 ```bash

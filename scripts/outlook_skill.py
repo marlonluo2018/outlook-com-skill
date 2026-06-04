@@ -1181,6 +1181,173 @@ def cmd_find_related(args):
         return 1
 
 
+def cmd_get_html(args):
+    """Get the raw HTMLBody of an email for template editing."""
+    try:
+        with OutlookSessionManager() as session:
+            email_item = _get_email_item(session, args.email_id)
+
+            subject = getattr(email_item, 'Subject', 'No Subject')
+            sender = getattr(email_item, 'SenderName', 'Unknown')
+            html_body = getattr(email_item, 'HTMLBody', '')
+
+            print(f"Subject: {subject}")
+            print(f"From: {sender}")
+            print(f"To: {getattr(email_item, 'To', '')}")
+            if getattr(email_item, 'CC', ''):
+                print(f"CC: {email_item.CC}")
+            print(f"HTML length: {len(html_body)} chars")
+            print(f"\n{'='*60}")
+            print(f"HTML_START")
+            print(html_body)
+            print(f"HTML_END")
+            print(f"{'='*60}")
+
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
+def cmd_edit_html(args):
+    """Edit an email's HTML and save.
+
+    If the email is a draft (unsent): modifies it IN PLACE and saves.
+    If the email is sent/received: creates a new draft with modified content.
+    """
+    try:
+        with OutlookSessionManager() as session:
+            source_item = _get_email_item(session, args.email_id)
+
+            is_draft = not getattr(source_item, 'Sent', True)
+
+            # Start with source HTML
+            html_body = getattr(source_item, 'HTMLBody', '')
+            if not html_body:
+                print("Error: Source email has no HTML body.", file=sys.stderr)
+                return 1
+
+            # Apply --body-file FIRST (full body replacement)
+            if args.body_file:
+                with open(args.body_file, 'r', encoding='utf-8') as f:
+                    html_body = f.read()
+                print(f"Body replaced from file: {args.body_file}")
+
+            # Apply --replace pairs on top
+            replacements_made = 0
+            if args.replace:
+                for pair in args.replace:
+                    if '::' not in pair:
+                        print(f"Error: Invalid replace format '{pair}'. Use 'old::new'.", file=sys.stderr)
+                        return 1
+                    old, new = pair.split('::', 1)
+                    if old in html_body:
+                        html_body = html_body.replace(old, new)
+                        replacements_made += 1
+                    else:
+                        print(f"WARNING: '{old}' not found in HTML body.")
+
+            if is_draft:
+                # --- Modify existing draft in place ---
+                draft = source_item
+
+                if args.subject:
+                    draft.Subject = args.subject
+                if args.to:
+                    draft.To = args.to.replace(',', '; ')
+                if args.cc:
+                    draft.CC = args.cc.replace(',', '; ')
+
+                draft.HTMLBody = html_body
+                draft.Save()
+
+                print(f"✅ Draft updated in place")
+            else:
+                # --- Create new draft from sent/received email ---
+                draft = session.outlook.CreateItem(0)  # olMailItem
+
+                if args.subject:
+                    draft.Subject = args.subject
+                else:
+                    draft.Subject = getattr(source_item, 'Subject', '')
+
+                if args.to:
+                    draft.To = args.to.replace(',', '; ')
+                else:
+                    draft.To = getattr(source_item, 'To', '')
+
+                if args.cc:
+                    draft.CC = args.cc.replace(',', '; ')
+                elif getattr(source_item, 'CC', ''):
+                    draft.CC = source_item.CC
+
+                draft.HTMLBody = html_body
+
+                # Copy attachments from source if requested
+                if args.copy_attachments:
+                    for i in range(1, source_item.Attachments.Count + 1):
+                        attach = source_item.Attachments.Item(i)
+                        try:
+                            cid = attach.PropertyAccessor.GetProperty(
+                                "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+                            )
+                            if cid:
+                                continue
+                        except Exception:
+                            pass
+                        import tempfile
+                        temp_path = os.path.join(tempfile.gettempdir(), attach.FileName)
+                        attach.SaveAsFile(temp_path)
+                        draft.Attachments.Add(temp_path)
+
+                draft.Save()
+                print(f"✅ New draft created in Drafts folder")
+
+            print(f"   Subject: {draft.Subject}")
+            print(f"   To: {draft.To}")
+            if draft.CC:
+                print(f"   CC: {draft.CC}")
+            if replacements_made:
+                print(f"   Replacements applied: {replacements_made}")
+            print(f"   HTML length: {len(html_body)} chars")
+
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
+def cmd_send_draft(args):
+    """Send an existing draft email."""
+    try:
+        with OutlookSessionManager() as session:
+            email_item = _get_email_item(session, args.email_id)
+
+            if getattr(email_item, 'Sent', False):
+                print("Error: This email has already been sent.", file=sys.stderr)
+                return 1
+
+            subject = getattr(email_item, 'Subject', 'No Subject')
+            to = getattr(email_item, 'To', '')
+            cc = getattr(email_item, 'CC', '')
+
+            if not to:
+                print("Error: Draft has no recipients.", file=sys.stderr)
+                return 1
+
+            email_item.Send()
+            print(f"✅ Email sent")
+            print(f"   Subject: {subject}")
+            print(f"   To: {to}")
+            if cc:
+                print(f"   CC: {cc}")
+
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description='Outlook Skill for BrainClaw - Email Management CLI')
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -1335,7 +1502,27 @@ def main():
     parser_download.add_argument('--all', action='store_true', help='Include embedded images (default: skip them)')
     parser_download.set_defaults(func=cmd_download_attachment)
 
-    # Index sync command
+    # Get HTML command
+    parser_get_html = subparsers.add_parser('get-html', help='Get raw HTMLBody of an email for template editing')
+    parser_get_html.add_argument('email_id', help='Email ID from search results')
+    parser_get_html.set_defaults(func=cmd_get_html)
+
+    # Send draft command
+    parser_send_draft = subparsers.add_parser('send-draft', help='Send an existing draft email')
+    parser_send_draft.add_argument('email_id', help='Draft email ID')
+    parser_send_draft.set_defaults(func=cmd_send_draft)
+
+    # Edit HTML command (template editing → save to Drafts)
+    parser_edit_html = subparsers.add_parser('edit-html', help='Edit email HTML and save as new draft')
+    parser_edit_html.add_argument('email_id', help='Source email ID (used as template)')
+    parser_edit_html.add_argument('--replace', action='append', help='Text replacement: "old::new" (repeatable)')
+    parser_edit_html.add_argument('--subject', help='Override subject line')
+    parser_edit_html.add_argument('--to', help='Override To recipients (comma separated)')
+    parser_edit_html.add_argument('--cc', help='Override CC recipients (comma separated)')
+    parser_edit_html.add_argument('--body-file', help='Replace entire HTML body from file path')
+    parser_edit_html.add_argument('--copy-attachments', action='store_true', help='Copy non-embedded attachments from source')
+    parser_edit_html.set_defaults(func=cmd_edit_html)
+
     # Parse arguments
     args = parser.parse_args()
     
