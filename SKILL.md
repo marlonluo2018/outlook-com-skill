@@ -1,5 +1,5 @@
 ---
-name: outlook
+name: outlook-skill
 description: Microsoft Outlook email management - search, list, compose, reply, forward, download attachments, thread tracking
 triggers: [
   "check email", "check inbox", "any new emails", "what's new",
@@ -13,9 +13,10 @@ triggers: [
   "get email", "view email", "show email details",
   "download attachment", "save attachment", "get attachment",
   "lookup contact", "who is",
-  "use as template", "edit email html", "modify email", "create from template"
+  "use as template", "edit email html", "modify email", "create from template",
+  "get signature", "view signature", "update signature", "change signature",
 ]
-operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall", "get-html", "edit-html", "send-draft"]
+operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall", "get-html", "edit-html", "send-draft", "get-signature", "update-signature"]
 ---
 
 # Outlook Skill
@@ -240,6 +241,35 @@ py -3 scripts/outlook_skill.py send-draft "<draft_email_id>"
 - Validates: must be unsent, must have at least one recipient
 - **⚠️ ALWAYS confirm with user before calling — NEVER send without approval**
 - **AI workflow:** `edit-html` (iterate until user approves) → `send-draft`
+
+### Get Signature
+```bash
+py -3 scripts/outlook_skill.py get-signature
+py -3 scripts/outlook_skill.py get-signature "SignatureName"
+py -3 scripts/outlook_skill.py get-signature "SignatureName" --format html
+```
+- No args: list all signatures with plain text content
+- With name: show that signature's content
+- `--format html`: show raw HTML instead of plain text
+
+### Update Signature
+```bash
+py -3 scripts/outlook_skill.py update-signature "SignatureName" --text "Line 1\nLine 2\nLine 3"
+py -3 scripts/outlook_skill.py update-signature "SignatureName" --find "old text" --replace "new text"
+py -3 scripts/outlook_skill.py update-signature "SignatureName" --after "anchor text" --insert "new line 1\nnew line 2"
+py -3 scripts/outlook_skill.py update-signature "SignatureName" --body "<p>full HTML</p>"
+```
+- `--text`: full plain text replacement (use `\n` for line breaks) — **preferred mode**
+- `--find`/`--replace`: targeted single-line substitution (e.g., update OOO dates)
+- `--after`/`--insert`: insert new lines after a matched text (use `\n` for multiple lines)
+- `--body`: full raw HTML replacement
+- Updates all 3 signature files: `.htm`, `.txt`, `.rtf`
+- Creates `.bak` backup before modifying
+- **⚠️ Show current signature to user first, confirm changes before applying**
+- **⚠️ Outlook must be restarted for changes to take effect:**
+```bash
+powershell -Command "Get-Process outlook -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2; Start-Process outlook"
+```
 
 ### Sending Inline Images
 ```bash
