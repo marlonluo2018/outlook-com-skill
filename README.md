@@ -458,6 +458,12 @@ Centralized in `backend/config.py`:
 
 ---
 
+## Why No Calendar
+
+This skill deliberately excludes calendar/scheduling functionality. In a corporate environment, meetings are managed through Microsoft Teams, and Outlook calendar events are tightly coupled with Teams — creating or modifying calendar items outside of Teams breaks the integration (no Teams meeting links, no lobby controls, no attendance tracking). The automation value of standalone calendar operations is too low to justify the integration gaps.
+
+---
+
 ## Privacy & Security
 
 - 100% local processing — no cloud services
