@@ -1,5 +1,5 @@
 ---
-name: outlook-skill
+name: outlook-com-skill
 description: Microsoft Outlook email management - search, list, compose, reply, forward, download attachments, thread tracking
 triggers: [
   "check email", "check inbox", "any new emails", "what's new",
@@ -50,7 +50,7 @@ py -3 scripts/outlook_skill.py find --type subject --query "Name" --days 14
 - `--folders`: use only when explicitly searching across folders (searches Inbox + Sent Items)
 - **AI guidance:** start with a small recent window first (usually 7-14 days)
 - If the first search does not find the email, widen the date range gradually and make the query more specific before broadening further
-- Use [`find-thread`](assistant_brain/skills/outlook-skill/SKILL.md:49) or [`find-related`](assistant_brain/skills/outlook-skill/SKILL.md:59) when older or broader history is needed
+- Use [`find-thread`](assistant_brain/skills/outlook-com-skill/SKILL.md:49) or [`find-related`](assistant_brain/skills/outlook-com-skill/SKILL.md:59) when older or broader history is needed
 
 ### Find Thread
 ```bash
