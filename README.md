@@ -1,6 +1,6 @@
 # Outlook Skill
 
-A Python-based skill for managing Microsoft Outlook emails through command-line interface. Provides 22 commands covering search, compose, reply, forward, template editing, folder management, and more.
+A Python-based skill for managing Microsoft Outlook emails through command-line interface. Provides 22 commands covering search, compose, reply, forward, template editing, folder management, and more. All send commands auto-output the sent email's EntryID for tracking.
 
 ## Overview
 
@@ -12,12 +12,14 @@ This is a **universal skill module** that can be integrated with any AI assistan
 - **Thread Tracking**: Find all emails in the same conversation (even when subject changes)
 - **Related Email Discovery**: Multi-strategy search by sender, recipients, keywords
 - **Email Operations**: Compose, reply, reply-all, forward, redirect, recall, move, and delete
-- **Template Editing**: Use any email as a template — read HTML, make targeted replacements, preview in Drafts, send when ready
+- **EntryID Auto-Output**: All send commands print the sent email's EntryID after sending — enables downstream tracking
+- **Importance/Priority Flag**: Set `--importance high|low` on outbound emails
+- **Template Editing**: Use any email as a template — read HTML, make targeted replacements, preview in Drafts, send when ready. Embedded images (CID) auto-preserved.
 - **Batch Operations**: Forward emails to multiple recipients via CSV (BCC, auto-batching)
 - **Folder Management**: Create, list, and manage Outlook folders
 - **Contact Lookup**: Retrieve contact information by email or display name (Exchange GAL)
 - **Attachment Handling**: Download attachments, embed inline images via CID
-- **HTML Email Support**: All emails use HTML format for rich content
+- **HTML Email Support**: All emails use HTML format with UTF-8 charset enforcement
 
 ## Requirements
 
@@ -147,15 +149,18 @@ Returns complete email: full body (plain text), all attachments, metadata. Embed
 py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Subject" --body "<p>HTML body</p>"
 py -3 scripts/outlook_skill.py compose --to "a@b.com" --subject "Report" --body "<p>See attached</p>" --attach "C:\file.pdf"
 py -3 scripts/outlook_skill.py compose --to "a@b.com" --subject "Photo" --body "<p><img src='cid:pic1'></p>" --inline-image "C:\img.png:pic1"
+py -3 scripts/outlook_skill.py compose --to "a@b.com" --subject "Urgent" --body "<p>Please review</p>" --importance high
 ```
 
 - `--to`: Recipients (comma-separated, required)
 - `--subject`: Subject line (required)
 - `--body`: HTML body (required)
-- `--cc`: CC recipients
+- `--cc`: CC recipients (repeatable flag or comma-separated)
 - `--attach`: File paths (comma-separated)
 - `--inline-image`: Embed images (`filepath:cid_name`, comma-separated)
+- `--importance`: Priority flag (`high` or `low`)
 - Sends immediately when called
+- Outputs `EntryID: {ID}` after sending
 
 #### ReplyAll (Default Reply)
 
@@ -163,9 +168,13 @@ py -3 scripts/outlook_skill.py compose --to "a@b.com" --subject "Photo" --body "
 py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>"
 py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>body</p>" --cc "extra@ibm.com"
 py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>body</p>" --attach "C:\file.pdf"
+py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>body</p>" --importance high
 ```
 
 Keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
+
+- `--importance`: Priority flag (`high` or `low`)
+- Outputs `EntryID: {ID}` after sending
 
 #### Reply (Sender Only)
 
@@ -176,6 +185,9 @@ py -3 scripts/outlook_skill.py reply "<email_id>" "<p>body</p>" --to "specific@i
 
 Replies to sender only. `--to`/`--cc` specify EXACT extra recipients (original To/CC NOT included).
 
+- `--importance`: Priority flag (`high` or `low`)
+- Outputs `EntryID: {ID}` after sending
+
 #### Forward
 
 ```bash
@@ -184,10 +196,12 @@ py -3 scripts/outlook_skill.py forward "<email_id>" --to "a@b.com,c@d.com" --cc 
 ```
 
 - `--to`: Recipients (required)
-- `--cc`: CC recipients
-- `--body`: Custom HTML message to prepend
+- `--cc`: CC recipients (repeatable flag or comma-separated)
+- `--body`: Custom HTML message to prepend (injected inside `<body>` tag)
 - `--attach`: Additional attachments
+- `--importance`: Priority flag (`high` or `low`)
 - Subject auto-prefixed with `FW:`
+- Outputs `EntryID: {ID}` after sending
 
 #### Redirect (Clear Recipients + New TO/CC)
 
@@ -197,6 +211,8 @@ py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>FYI</p>" --to "a@b.com"
 ```
 
 Clears ALL existing TO/CC, adds new ones. Preserves original email body as quoted content.
+
+- Outputs `EntryID: {ID}` after sending
 
 #### Batch Forward
 
@@ -242,15 +258,15 @@ py -3 scripts/outlook_skill.py edit-html "<email_id>" --body-file "C:\temp\modif
 Behavior:
 
 - **Draft (unsent)**: Modifies in place — same email updated, no duplicates
-- **Sent/Received**: Creates a new draft — original untouched
+- **Sent/Received**: Creates a new draft — original untouched, embedded images (CID) auto-preserved
 
 Options:
 
 - `--replace "old::new"`: Text replacement (repeatable)
 - `--subject`: Override subject
-- `--to` / `--cc`: Override recipients
+- `--to` / `--cc`: Override recipients (resolves SMTP addresses)
 - `--body-file`: Replace entire HTML from file
-- `--copy-attachments`: Copy file attachments from source
+- `--copy-attachments`: Copy file attachments from source (non-embedded only; embedded images are always preserved)
 
 #### Send Draft
 
@@ -374,10 +390,12 @@ outlook-skill/
 
 1. **No Caching**: All operations work directly with Outlook COM objects
 2. **Message ID Based**: Uses Outlook's EntryID for email identification
-3. **Server-Side Search**: Prioritizes Restrict filter over client-side scan
-4. **In-Place Editing**: Draft templates modify the same email, no duplicates
-5. **HTML Format**: All emails use HTML for rich formatting
-6. **Single Merged Scan**: find-related scans each folder once for all strategies
+3. **EntryID Auto-Output**: All send commands print the sent email's EntryID for downstream tracking
+4. **Server-Side Search**: Prioritizes Restrict filter over client-side scan
+5. **In-Place Editing**: Draft templates modify the same email, no duplicates
+6. **HTML Format**: All emails use HTML with UTF-8 charset enforcement
+7. **Single Merged Scan**: find-related scans each folder once for all strategies
+8. **CID Preservation**: Template editing auto-copies embedded images to new drafts
 
 ### Technical Details
 

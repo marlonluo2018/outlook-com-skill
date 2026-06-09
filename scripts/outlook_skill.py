@@ -458,6 +458,17 @@ def _add_attachments(mail_item, attach_str):
         mail_item.Attachments.Add(filepath)
 
 
+def _set_importance(mail_item, importance_str):
+    """Set email importance/priority flag. Values: high, low, normal (default)."""
+    if not importance_str:
+        return
+    level = importance_str.strip().lower()
+    if level == "high":
+        mail_item.Importance = 2  # olImportanceHigh
+    elif level == "low":
+        mail_item.Importance = 0  # olImportanceLow
+
+
 def _add_inline_images(mail_item, inline_str):
     """Embed images into the HTML body using CID.
 
@@ -565,6 +576,40 @@ def _format_forward_message_html(message_text: str) -> str:
     return _wrap_body_font(inner)
 
 
+def _ensure_utf8_charset(html: str) -> str:
+    """Ensure HTML declares UTF-8 charset. Replace any existing charset or add one."""
+    charset_pattern = re.compile(
+        r'<meta[^>]*charset=["\']?[^"\'>]+["\']?[^>]*/?>',
+        re.IGNORECASE
+    )
+    content_type_pattern = re.compile(
+        r'<meta[^>]*http-equiv=["\']?Content-Type["\']?[^>]*/?>',
+        re.IGNORECASE
+    )
+    utf8_meta = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+
+    if charset_pattern.search(html):
+        html = charset_pattern.sub(utf8_meta, html, count=1)
+    elif content_type_pattern.search(html):
+        html = content_type_pattern.sub(utf8_meta, html, count=1)
+    else:
+        head_match = re.search(r'(<head[^>]*>)', html, re.IGNORECASE)
+        if head_match:
+            insert_pos = head_match.end()
+            html = html[:insert_pos] + utf8_meta + html[insert_pos:]
+    return html
+
+
+def _inject_before_body(prepend_html: str, full_html: str) -> str:
+    """Insert prepend_html inside the <body> tag and ensure UTF-8 charset."""
+    full_html = _ensure_utf8_charset(full_html)
+    body_match = re.search(r'(<body[^>]*>)', full_html, re.IGNORECASE)
+    if body_match:
+        insert_pos = body_match.end()
+        return full_html[:insert_pos] + prepend_html + full_html[insert_pos:]
+    return prepend_html + full_html
+
+
 def _get_smtp_address(recipient):
     """Extract SMTP email address from an Outlook Recipient object."""
     try:
@@ -589,13 +634,23 @@ def _remove_self_from_recipients(reply, current_user_email):
         reply.Recipients.Remove(i)
 
 
-def _add_recipients(reply, to_str, cc_str):
+def _normalize_cc(cc_arg):
+    """Normalize args.cc (list from append or single string) into one comma-separated string."""
+    if not cc_arg:
+        return ""
+    if isinstance(cc_arg, list):
+        return ",".join(cc_arg)
+    return cc_arg
+
+
+def _add_recipients(reply, to_str, cc_arg):
     """Append --to and --cc to existing recipients."""
     if to_str:
         for r in to_str.replace(";", ",").split(","):
             r = r.strip()
             if r:
                 reply.Recipients.Add(r)
+    cc_str = _normalize_cc(cc_arg)
     if cc_str:
         for r in cc_str.replace(";", ",").split(","):
             r = r.strip()
@@ -620,6 +675,25 @@ def _build_reply_header(email_item, current_user_email):
         header += f'<b>Cc:</b> {original_cc}<br>'
     header += f'<b>Subject:</b> {original_subject}</p></div>'
     return header
+
+
+def _print_sent_entry_id(session, subject):
+    """Retrieve and print EntryID of the most recently sent email matching subject."""
+    import time
+    time.sleep(1)
+    try:
+        ns = session.outlook.GetNamespace("MAPI")
+        sent_folder = ns.GetDefaultFolder(5)  # 5 = olFolderSentMail
+        items = sent_folder.Items
+        items.Sort("[SentOn]", True)
+        item = items.GetFirst()
+        for _ in range(5):
+            if item and subject in str(item.Subject):
+                print(f"EntryID: {item.EntryID}")
+                return
+            item = items.GetNext()
+    except Exception:
+        pass
 
 
 def cmd_replyall(args):
@@ -661,6 +735,7 @@ def cmd_replyall(args):
                 _add_recipients(reply, args.to, args.cc)
                 reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
 
+            reply.HTMLBody = _ensure_utf8_charset(reply.HTMLBody)
             reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
 
             if reply.Recipients.Count == 0:
@@ -670,8 +745,11 @@ def cmd_replyall(args):
             count = reply.Recipients.Count
             _add_inline_images(reply, args.inline_image)
             _add_attachments(reply, args.attach)
+            _set_importance(reply, args.importance)
+            subject = reply.Subject
             reply.Send()
             print(f"ReplyAll sent to {count} recipient(s)")
+            _print_sent_entry_id(session, subject)
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -711,6 +789,7 @@ def cmd_reply(args):
                 _add_recipients(reply, args.to, args.cc)
                 reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
 
+            reply.HTMLBody = _ensure_utf8_charset(reply.HTMLBody)
             reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
 
             if reply.Recipients.Count == 0:
@@ -720,8 +799,11 @@ def cmd_reply(args):
             count = reply.Recipients.Count
             _add_inline_images(reply, args.inline_image)
             _add_attachments(reply, args.attach)
+            _set_importance(reply, args.importance)
+            subject = reply.Subject
             reply.Send()
             print(f"Reply sent to {count} recipient(s)")
+            _print_sent_entry_id(session, subject)
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -732,7 +814,8 @@ def cmd_compose(args):
     """Compose and send new email (always HTML format)"""
     try:
         to_list = [x.strip() for x in args.to.replace(";", ",").split(",")] if args.to else []
-        cc_list = [x.strip() for x in args.cc.replace(";", ",").split(",")] if args.cc else []
+        cc_normalized = _normalize_cc(args.cc)
+        cc_list = [x.strip() for x in cc_normalized.replace(";", ",").split(",")] if cc_normalized else []
 
         with OutlookSessionManager() as session:
             mail = session.outlook.CreateItem(0)  # 0 = olMailItem
@@ -751,13 +834,15 @@ def cmd_compose(args):
             mail.Display(False)
 
             # Prepend body to signature HTML (same pattern as reply)
-            mail.HTMLBody = _wrap_body_font(args.body) + mail.HTMLBody
+            mail.HTMLBody = _ensure_utf8_charset(_wrap_body_font(args.body) + mail.HTMLBody)
 
             _add_inline_images(mail, args.inline_image)
             _add_attachments(mail, args.attach)
+            _set_importance(mail, args.importance)
             mail.Send()
             total_recipients = len(to_list) + len(cc_list)
             print(f"HTML email sent successfully to {total_recipients} recipient(s)")
+            _print_sent_entry_id(session, args.subject)
 
         return 0
     except Exception as e:
@@ -850,9 +935,10 @@ def cmd_forward(args):
                     if r:
                         forward.Recipients.Add(r)
 
-            # Add CC recipients
+            # Add CC recipients (args.cc is a list from action='append', each entry may be comma-separated)
             if args.cc:
-                for r in args.cc.replace(";", ",").split(","):
+                cc_joined = ",".join(args.cc)
+                for r in cc_joined.replace(";", ",").split(","):
                     r = r.strip()
                     if r:
                         cc_recip = forward.Recipients.Add(r)
@@ -863,11 +949,11 @@ def cmd_forward(args):
                 prepend_html = _format_forward_message_html(args.body)
                 try:
                     original_html = forward.HTMLBody
-                    forward.HTMLBody = prepend_html + original_html
+                    forward.HTMLBody = _inject_before_body(prepend_html, original_html)
                 except Exception:
                     # Meeting items / special types need inspector initialization
                     _ = forward.GetInspector
-                    forward.HTMLBody = prepend_html + forward.HTMLBody
+                    forward.HTMLBody = _inject_before_body(prepend_html, forward.HTMLBody)
 
             if forward.Recipients.Count == 0:
                 print("Error: No recipients specified. Use --to.")
@@ -883,9 +969,11 @@ def cmd_forward(args):
 
             _add_inline_images(forward, args.inline_image)
             _add_attachments(forward, args.attach)
+            _set_importance(forward, args.importance)
             forward.Send()
             print(f"Forward sent to {recipient_count} recipient(s)")
             print(f"Subject: {final_subject}")
+            _print_sent_entry_id(session, final_subject)
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -917,7 +1005,7 @@ def cmd_redirect(args):
             # Signature + body
             forward.Display(False)
             signature_html = forward.HTMLBody
-            forward.HTMLBody = _wrap_body_font(args.body) + signature_html
+            forward.HTMLBody = _ensure_utf8_charset(_wrap_body_font(args.body) + signature_html)
 
             recipient_count = forward.Recipients.Count
             final_subject = forward.Subject
@@ -927,6 +1015,7 @@ def cmd_redirect(args):
             forward.Send()
             print(f"Redirected to {recipient_count} recipient(s)")
             print(f"Subject: {final_subject}")
+            _print_sent_entry_id(session, final_subject)
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -1255,8 +1344,9 @@ def cmd_edit_html(args):
                     draft.Subject = args.subject
                 if args.to:
                     draft.To = args.to.replace(',', '; ')
-                if args.cc:
-                    draft.CC = args.cc.replace(',', '; ')
+                cc_normalized = _normalize_cc(args.cc)
+                if cc_normalized:
+                    draft.CC = cc_normalized.replace(',', '; ')
 
                 draft.HTMLBody = html_body
                 draft.Save()
@@ -1274,16 +1364,51 @@ def cmd_edit_html(args):
                 if args.to:
                     draft.To = args.to.replace(',', '; ')
                 else:
-                    draft.To = getattr(source_item, 'To', '')
+                    to_addrs = []
+                    for i in range(1, source_item.Recipients.Count + 1):
+                        recip = source_item.Recipients.Item(i)
+                        if recip.Type == 1:  # olTo
+                            to_addrs.append(_get_smtp_address(recip))
+                    draft.To = '; '.join(to_addrs)
 
-                if args.cc:
-                    draft.CC = args.cc.replace(',', '; ')
-                elif getattr(source_item, 'CC', ''):
-                    draft.CC = source_item.CC
+                cc_normalized = _normalize_cc(args.cc)
+                if cc_normalized:
+                    draft.CC = cc_normalized.replace(',', '; ')
+                else:
+                    cc_addrs = []
+                    for i in range(1, source_item.Recipients.Count + 1):
+                        recip = source_item.Recipients.Item(i)
+                        if recip.Type == 2:  # olCC
+                            cc_addrs.append(_get_smtp_address(recip))
+                    if cc_addrs:
+                        draft.CC = '; '.join(cc_addrs)
 
+                # Set modified HTML body first
                 draft.HTMLBody = html_body
 
-                # Copy attachments from source if requested
+                # Copy embedded images to preserve cid: references in HTML
+                import tempfile
+                for i in range(1, source_item.Attachments.Count + 1):
+                    attach = source_item.Attachments.Item(i)
+                    try:
+                        cid = attach.PropertyAccessor.GetProperty(
+                            "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+                        )
+                    except Exception:
+                        cid = None
+                    if cid:
+                        temp_path = os.path.join(tempfile.gettempdir(), attach.FileName)
+                        attach.SaveAsFile(temp_path)
+                        new_attach = draft.Attachments.Add(temp_path)
+                        new_attach.PropertyAccessor.SetProperty(
+                            "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
+                        )
+                        os.remove(temp_path)
+
+                # Force Outlook to re-resolve CID references
+                draft.HTMLBody = draft.HTMLBody
+
+                # Copy file attachments (non-embedded) from source if requested
                 if args.copy_attachments:
                     for i in range(1, source_item.Attachments.Count + 1):
                         attach = source_item.Attachments.Item(i)
@@ -1827,9 +1952,10 @@ def main():
     parser_replyall.add_argument('email_id', help='Email ID from search results')
     parser_replyall.add_argument('body', help='Reply text in HTML format')
     parser_replyall.add_argument('--to', help='Additional To recipients (comma separated)')
-    parser_replyall.add_argument('--cc', help='Additional CC recipients (comma separated)')
+    parser_replyall.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_replyall.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_replyall.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
+    parser_replyall.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_replyall.set_defaults(func=cmd_replyall)
 
     # Reply command (specify mode — sender only, --to/--cc specify extras)
@@ -1837,9 +1963,10 @@ def main():
     parser_reply.add_argument('email_id', help='Email ID from search results')
     parser_reply.add_argument('body', help='Reply text in HTML format')
     parser_reply.add_argument('--to', help='Extra To recipients (comma separated)')
-    parser_reply.add_argument('--cc', help='Extra CC recipients (comma separated)')
+    parser_reply.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_reply.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_reply.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
+    parser_reply.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_reply.set_defaults(func=cmd_reply)
     
     # Compose command
@@ -1847,19 +1974,21 @@ def main():
     parser_compose.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_compose.add_argument('--subject', required=True, help='Email subject')
     parser_compose.add_argument('--body', required=True, help='Email body')
-    parser_compose.add_argument('--cc', help='CC recipients (comma separated)')
+    parser_compose.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_compose.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_compose.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
+    parser_compose.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_compose.set_defaults(func=cmd_compose)
     
     # Forward command
     parser_forward = subparsers.add_parser('forward', help='Forward an email to specified recipients')
     parser_forward.add_argument('email_id', help='Email ID from search results')
     parser_forward.add_argument('--to', required=True, help='To recipients (comma separated)')
-    parser_forward.add_argument('--cc', help='CC recipients (comma separated)')
+    parser_forward.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_forward.add_argument('--body', help='Custom message to prepend')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_forward.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
+    parser_forward.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_forward.set_defaults(func=cmd_forward)
 
     # Redirect command (clear all recipients, add new ones)
@@ -1867,7 +1996,7 @@ def main():
     parser_redirect.add_argument('email_id', help='Email ID from search results')
     parser_redirect.add_argument('body', help='Message body in HTML format')
     parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
-    parser_redirect.add_argument('--cc', help='CC recipients (comma separated)')
+    parser_redirect.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_redirect.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_redirect.set_defaults(func=cmd_redirect)
@@ -1953,7 +2082,7 @@ def main():
     parser_edit_html.add_argument('--replace', action='append', help='Text replacement: "old::new" (repeatable)')
     parser_edit_html.add_argument('--subject', help='Override subject line')
     parser_edit_html.add_argument('--to', help='Override To recipients (comma separated)')
-    parser_edit_html.add_argument('--cc', help='Override CC recipients (comma separated)')
+    parser_edit_html.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_edit_html.add_argument('--body-file', help='Replace entire HTML body from file path')
     parser_edit_html.add_argument('--copy-attachments', action='store_true', help='Copy non-embedded attachments from source')
     parser_edit_html.set_defaults(func=cmd_edit_html)

@@ -24,6 +24,16 @@ operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "
 > **⚠️ ALL emails use HTML format:** `<p>text</p>`, `<br>`, `<strong>bold</strong>`
 > **⚠️ No closing or signature in email body** — Outlook auto-appends signature. Do not add "Thanks, Marlon" or similar.
 
+## Terminology
+
+| Term | Meaning | Commands |
+|------|---------|----------|
+| **Draft review** | AI shows email text in chat for user approval before sending | `replyall`, `reply`, `compose`, `forward` |
+| **Template editing** | Use an existing email as template → creates new item in Outlook Drafts folder for preview/iteration | `edit-html` → `send-draft` |
+
+- When user says **"draft"**, **"先draft"**, or **"let me review"** → they want **draft review** (show in chat, wait for approval, then send via standard commands).
+- **Template editing** is a separate workflow for modifying existing emails as templates. It saves to Outlook Drafts folder — only use when user explicitly asks to "edit as template" or "use as template".
+
 ## Commands
 
 ### Find Recent Emails
@@ -50,7 +60,7 @@ py -3 scripts/outlook_skill.py find --type subject --query "Name" --days 14
 - `--folders`: use only when explicitly searching across folders (searches Inbox + Sent Items)
 - **AI guidance:** start with a small recent window first (usually 7-14 days)
 - If the first search does not find the email, widen the date range gradually and make the query more specific before broadening further
-- Use [`find-thread`](assistant_brain/skills/outlook-com-skill/SKILL.md:49) or [`find-related`](assistant_brain/skills/outlook-com-skill/SKILL.md:59) when older or broader history is needed
+- Use `find-thread` or `find-related` when older or broader history is needed
 
 ### Find Thread
 ```bash
@@ -105,9 +115,11 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>"
 py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --cc "extra@ibm.com"
 py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --importance high
 ```
 - Keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
 - `--attach`: File path(s) to attach (comma separated for multiple)
+- `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox
 - **This is the default reply command.** Use unless you need to narrow recipients.
 - **⚠️ ALWAYS show draft to user first — NEVER send before user approval**
 
@@ -125,10 +137,12 @@ py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>" --attach "C
 ```bash
 py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>"
 py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>" --importance high
 py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML with <img src='cid:pic1'></p>" --inline-image "C:\path\img.png:pic1"
 ```
 - `--attach`: File path(s) to attach (comma separated for multiple)
 - `--inline-image`: Embed image inline via CID (format: `filepath:cid_name`, comma separated)
+- `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox
 - **⚠️ ALWAYS show draft to user in chat window first — NEVER send before user approval**
 - AI presents the email as readable plain text in chat
 - Only call this command after user explicitly confirms "send" or "approve"
@@ -205,7 +219,7 @@ py -3 scripts/outlook_skill.py get-email "<email_id>"
 - Use after search/thread/related to read the actual content
 - **Embedded images:** Auto-extracted to `%TEMP%\outlook_inline\<id>\`. Paths printed in output — use Read tool to view.
 
-### Get Email HTML (Template Reading)
+### Get Email HTML (Template Editing — Step 1: Read)
 ```bash
 py -3 scripts/outlook_skill.py get-html "<email_id>"
 ```
@@ -231,6 +245,7 @@ py -3 scripts/outlook_skill.py edit-html "<email_id>" --replace "old::new" --cop
 - `--cc`: Override CC recipients (comma separated)
 - `--body-file`: Replace entire HTML body from a local file
 - `--copy-attachments`: Copy file attachments from source (skips embedded images)
+- Inline/embedded images (CID-referenced) are **always preserved** automatically
 - **AI workflow:** `get-html` → analyze → `edit-html` with targeted replacements
 
 ### Send Draft
