@@ -9,9 +9,11 @@ import re
 import argparse
 from typing import Optional
 
-# Set UTF-8 encoding for stdout to handle emojis and special characters
+# Force UTF-8 for stdout and stderr on Windows
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # Add parent directory to path to allow imports from backend and tools
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -678,22 +680,23 @@ def _build_reply_header(email_item, current_user_email):
 
 
 def _print_sent_entry_id(session, subject):
-    """Retrieve and print EntryID of the most recently sent email matching subject."""
+    """Retrieve and print EntryID of the most recently sent email."""
     import time
-    time.sleep(1)
-    try:
-        ns = session.outlook.GetNamespace("MAPI")
-        sent_folder = ns.GetDefaultFolder(5)  # 5 = olFolderSentMail
-        items = sent_folder.Items
-        items.Sort("[SentOn]", True)
-        item = items.GetFirst()
-        for _ in range(5):
-            if item and subject in str(item.Subject):
+    from datetime import datetime, timedelta, timezone
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=30)
+    for attempt in range(6):
+        time.sleep(2)
+        try:
+            ns = session.outlook.GetNamespace("MAPI")
+            sent_folder = ns.GetDefaultFolder(5)  # 5 = olFolderSentMail
+            items = sent_folder.Items
+            items.Sort("[SentOn]", True)
+            item = items.GetFirst()
+            if item and item.SentOn.replace(tzinfo=timezone.utc) >= threshold:
                 print(f"EntryID: {item.EntryID}")
                 return
-            item = items.GetNext()
-    except Exception:
-        pass
+        except Exception:
+            pass
 
 
 def cmd_replyall(args):
@@ -1640,8 +1643,15 @@ def _update_rtf_signature(rtf_path, find_text, replace_text):
         return False
     with open(rtf_path, 'rb') as f:
         content = f.read().decode('latin-1')
+    escaped_find = _rtf_escape(find_text)
+    escaped_replace = _rtf_escape(replace_text)
+    if escaped_find in content:
+        content = content.replace(escaped_find, escaped_replace)
+        with open(rtf_path, 'w', encoding='latin-1', newline='') as f:
+            f.write(content)
+        return True
     if find_text in content:
-        content = content.replace(find_text, replace_text)
+        content = content.replace(find_text, escaped_replace)
         with open(rtf_path, 'w', encoding='latin-1', newline='') as f:
             f.write(content)
         return True
@@ -1859,7 +1869,7 @@ def cmd_update_signature(args):
                     rtf_new_lines = ''
                     for line in args.insert.split('\\n'):
                         if line.strip():
-                            rtf_new_lines += f'\r\n\\par {rtf_prefix}{line}'
+                            rtf_new_lines += f'\r\n\\par {rtf_prefix}{_rtf_escape(line)}'
                         else:
                             rtf_new_lines += '\r\n\\par '
                     rtf_content = rtf_content[:rtf_eol] + rtf_new_lines + rtf_content[rtf_eol:]
