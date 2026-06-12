@@ -201,6 +201,14 @@ def extract_email_info_minimal(item) -> Dict[str, Any]:
             has_attachments = False
             attachments_list = []
         
+        # Body preview — first 200 chars for quick scope judgment
+        body_preview = ""
+        try:
+            raw_body = getattr(item, 'Body', '') or ''
+            body_preview = raw_body[:200].strip()
+        except Exception:
+            pass
+
         return {
             "entry_id": entry_id,
             "subject": subject,
@@ -216,6 +224,7 @@ def extract_email_info_minimal(item) -> Dict[str, Any]:
             "attachments_count": len(attachments_list),
             "embedded_images_count": embedded_images_count,
             "embedded_images": embedded_images_list,
+            "body_preview": body_preview,
             "attachments_processed": True
         }
     except Exception as e:

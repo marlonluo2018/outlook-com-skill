@@ -28,7 +28,7 @@ operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "
 
 | Term | Meaning | Commands |
 |------|---------|----------|
-| **Draft review** | AI shows email text in chat for user approval before sending | `replyall`, `reply`, `compose`, `forward` |
+| **Draft review** | AI shows email text in chat for user approval before sending | `reply`, `compose`, `forward` |
 | **Template editing** | Use an existing email as template → creates new item in Outlook Drafts folder for preview/iteration | `edit-html` → `send-draft` |
 
 - When user says **"draft"**, **"先draft"**, or **"let me review"** → they want **draft review** (show in chat, wait for approval, then send via standard commands).
@@ -110,35 +110,26 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 - **Why:** Outlook search by email address unreliable; use display name instead
 - **Name lookup:** Resolves display names against Exchange Global Address List
 
-### ReplyAll (default)
+### Reply
 ```bash
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>"
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --cc "extra@ibm.com"
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --attach "C:\path\file.pdf"
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>" --importance high
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --cc "extra@ibm.com"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --importance high
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --only
 ```
-- Keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
+- **Default: reply-all** — keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
+- **`--only`: reply to From (sender) only** — use only when user explicitly asks to narrow
 - `--attach`: File path(s) to attach (comma separated for multiple)
 - `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox
-- **This is the default reply command.** Use unless you need to narrow recipients.
 - **⚠️ ALWAYS show draft to user first — NEVER send before user approval**
-
-### Reply (specify mode)
-```bash
-py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>"
-py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>" --to "specific@ibm.com"
-py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>" --attach "C:\path\file.pdf"
-```
-- Replies to sender only. `--to`/`--cc` specify EXACT extra recipients (original To/CC NOT included).
-- `--attach`: File path(s) to attach (comma separated for multiple)
-- Use when you want to narrow the recipient list.
 
 ### Compose Email
 ```bash
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>"
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>" --attach "C:\path\file.pdf"
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML</p>" --importance high
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML with <img src='cid:pic1'></p>" --inline-image "C:\path\img.png:pic1"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html" --importance high
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html" --inline-image "C:\path\img.png:pic1"
 ```
 - `--attach`: File path(s) to attach (comma separated for multiple)
 - `--inline-image`: Embed image inline via CID (format: `filepath:cid_name`, comma separated)
@@ -151,13 +142,13 @@ py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>
 ### Forward (single)
 ```bash
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com"
-py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com,user2@ibm.com" --cc "manager@ibm.com" --body "<p>FYI</p>"
+py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com,user2@ibm.com" --cc "manager@ibm.com" --body-file "C:\temp\body.html"
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com" --attach "C:\path\file.pdf"
 ```
 - Forwards an email to specified recipients
 - `--to` (required): Comma-separated list of To recipients
 - `--cc` (optional): Comma-separated list of CC recipients
-- `--body` (optional): Custom HTML message to prepend
+- `--body-file` (preferred) or `--body` (optional): Custom HTML message to prepend
 - `--attach` (optional): File path(s) to attach (comma separated for multiple)
 - Subject auto-prefixed with `FW:`
 - Preserves original email formatting
@@ -176,12 +167,12 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 
 ### Redirect (Clear Recipients + New TO/CC)
 ```bash
-py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>New message body</p>" --to "a@b.com,c@d.com"
-py -3 scripts/outlook_skill.py redirect "<email_id>" "<p>FYI</p>" --to "a@b.com" --cc "b@b.com"
+py -3 scripts/outlook_skill.py redirect "<email_id>" --body-file "C:\temp\body.html" --to "a@b.com,c@d.com"
+py -3 scripts/outlook_skill.py redirect "<email_id>" --body-file "C:\temp\body.html" --to "a@b.com" --cc "b@b.com"
 ```
 - Clears all existing TO and CC recipients, then adds new ones
 - Preserves original email body as quoted content (like forward)
-- `body` (required): HTML message prepended above original content
+- `--body-file` (preferred) or positional `body`: HTML message prepended above original content
 - `--to` (required): New TO recipients (comma separated)
 - `--cc`: New CC recipients (comma separated)
 - `--attach`: File path(s) to attach (comma separated)
@@ -292,7 +283,7 @@ py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>
 ```
 - `--inline-image`: Format is `filepath:cid_name` (comma separated for multiple)
 - Reference in HTML body via `<img src="cid:cid_name">`
-- Works with `compose`, `reply`, `replyall`, `forward`, `redirect`
+- Works with `compose`, `reply`, `forward`, `redirect`
 
 ### Viewing Embedded Images
 When search results show `🖼 Embedded images (N): filename.png, ...`:
@@ -328,17 +319,22 @@ class BatchConfig:
 
 ## ⚠️ Special Characters in Email Body
 
-**CRITICAL:** Replace `$` with `&#36;` in HTML body to avoid shell variable issues.
+**CRITICAL:** Always use `--body-file` to pass email body content. This bypasses shell variable expansion (`$0`, `$1`, `$VAR` etc. would be interpreted by bash if passed inline).
 
-```html
-<!-- ❌ WRONG: $80,000 displays as ,000 -->
-<p>Cost: $80,000 USD</p>
+**Mandatory workflow:**
+1. Write HTML body to a temp file: `./downloads/temp_body.html`
+2. Pass via `--body-file "./downloads/temp_body.html"`
+3. The file is read by Python directly — no shell expansion occurs
 
-<!-- ✅ CORRECT: Use HTML entity -->
-<p>Cost: &#36;80,000 USD</p>
+```bash
+# ✅ CORRECT: body in file, $ signs preserved
+py -3 scripts/outlook_skill.py reply "<id>" --body-file "./downloads/temp_body.html"
+
+# ❌ WRONG: inline body, $ signs eaten by bash
+py -3 scripts/outlook_skill.py reply "<id>" "Cost: $80,000"
 ```
 
-**Common HTML entities:** `$` = `&#36;` | `&` = `&amp;` | `<` = `&lt;` | `>` = `&gt;`
+**Fallback (if --body-file unavailable):** Replace `$` with `&#36;` in inline body args.
 
 ## Find Workflow for Email Addresses
 

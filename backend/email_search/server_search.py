@@ -8,7 +8,7 @@ Outlook's AdvancedSearch functionality, which is more efficient for large folder
 # Standard library imports
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 # Local application imports
 from ..logging_config import get_logger
@@ -653,10 +653,7 @@ def search_related_emails(
             sender_name = ref_info.get("sender", "")
             if sender_name and sender_name != "Unknown":
                 sender_keywords = _extract_search_keywords(ref_info)
-                sender_strong_keywords, _ = _split_keywords_by_strength(
-                    sender_keywords
-                )
-                sender_topic_keywords = sender_strong_keywords or sender_keywords[:1]
+                sender_min_overlap = min(2, len(sender_keywords))
                 sender_name_lower = sender_name.lower()
 
                 for info in merged_pool:
@@ -667,14 +664,14 @@ def search_related_emails(
                     if sender_name_lower not in candidate_sender:
                         continue
                     sender_overlap = _count_keyword_overlap(
-                        info, sender_topic_keywords
+                        info, sender_keywords
                     )
-                    if sender_topic_keywords and sender_overlap < 1:
+                    if sender_overlap < sender_min_overlap:
                         continue
                     seen_ids.add(eid)
                     matched = dict(info)
                     matched["_confidence"] = min(
-                        0.60 + (0.05 * max(sender_overlap - 1, 0)),
+                        0.60 + (0.05 * max(sender_overlap - sender_min_overlap, 0)),
                         0.75,
                     )
                     matched["_strategy"] = "sender"
@@ -720,39 +717,27 @@ def search_related_emails(
                 logger.info(f"Strategy 'recipient': found {len(recipient_results)}")
             output["recipient_results"] = recipient_results
 
-        # Strategy 4: Keyword extraction + subject/preview match
+        # Strategy 4: Keyword extraction + multi-keyword AND match
         if "keyword" in strategies:
             keywords = _extract_search_keywords(ref_info)
             if keywords:
-                strong_keywords, weak_keywords = _split_keywords_by_strength(keywords)
-                if not strong_keywords:
-                    strong_keywords = keywords[:1]
-                all_keywords = strong_keywords + [
-                    kw for kw in weak_keywords if kw not in strong_keywords
-                ]
-                min_overlap = 2 if len(all_keywords) >= 2 else 1
+                min_overlap = min(3, len(keywords))
 
                 for info in merged_pool:
                     eid = info.get('entry_id', '')
                     if not eid or eid in seen_ids:
                         continue
-                    strong_overlap = _count_keyword_overlap(info, strong_keywords)
-                    if strong_overlap < 1:
-                        continue
-                    overlap = _count_keyword_overlap(info, all_keywords)
+                    overlap = _count_keyword_overlap(info, keywords)
                     if overlap < min_overlap:
                         continue
                     seen_ids.add(eid)
                     matched = dict(info)
                     matched["_confidence"] = min(
-                        0.45
-                        + (0.10 * max(strong_overlap - 1, 0))
-                        + (0.05 * max(overlap - strong_overlap, 0)),
+                        0.45 + (0.08 * max(overlap - min_overlap, 0)),
                         0.70,
                     )
-                    matched["_strategy"] = f"keyword"
+                    matched["_strategy"] = "keyword"
                     matched["_keyword_overlap"] = overlap
-                    matched["_strong_keyword_overlap"] = strong_overlap
                     keyword_results.append(matched)
                 logger.info(f"Strategy 'keyword': found {len(keyword_results)}")
             output["keyword_results"] = keyword_results
@@ -794,31 +779,6 @@ def search_related_emails(
     return output
 
 
-def _split_keywords_by_strength(keywords: List[str]) -> Tuple[List[str], List[str]]:
-    """Separate strong topic keywords from weaker context keywords."""
-    weak_keywords = {
-        "philippines", "china", "india", "singapore", "malaysia",
-        "indonesia", "thailand", "vietnam", "global", "regional",
-        "apac", "asean", "team", "project", "program", "learning",
-        "services", "foundation", "requester", "requesters",
-    }
-
-    strong = []
-    weak = []
-
-    for kw in keywords:
-        normalized = (kw or "").strip().lower()
-        if not normalized:
-            continue
-
-        if normalized in weak_keywords:
-            weak.append(normalized)
-            continue
-
-        strong.append(normalized)
-
-    return list(dict.fromkeys(strong)), list(dict.fromkeys(weak))
-
 
 def _count_keyword_overlap(email_info: dict, keywords: List[str]) -> int:
     """Count how many reference keywords appear in the candidate email."""
@@ -835,16 +795,12 @@ def _extract_search_keywords(email_info: dict) -> List[str]:
     """Extract high-signal keywords from email subject and body for related search."""
     import re
 
-    common_words = {
+    stop_words = {
         "the", "and", "for", "from", "this", "that", "with", "have",
         "your", "you", "are", "not", "was", "all", "can", "has",
         "about", "which", "will", "would", "been", "they", "their",
-        "please", "thanks", "regards", "dear", "hello", "attached",
-        "external", "training", "request", "update", "follow", "followup",
-        "reminder", "quote", "quotation", "email", "mail", "team",
-        "reply", "response", "responses", "urgent", "proposal", "invoice",
-        "foundation", "course", "session", "private", "cohort", "virtual",
-        "instructor", "instructed", "learnquest", "learn", "quest", "ibm",
+        "but", "its", "our", "also", "than", "then", "into", "only",
+        "please", "thanks", "regards", "dear", "hello", "hi",
     }
 
     def _clean_and_extract(text: str) -> List[str]:
@@ -860,7 +816,7 @@ def _extract_search_keywords(email_info: dict) -> List[str]:
             normalized = word.strip("._-#").lower()
             if not normalized:
                 continue
-            if normalized in common_words:
+            if normalized in stop_words:
                 continue
             if normalized.isdigit() and len(normalized) <= 4:
                 continue

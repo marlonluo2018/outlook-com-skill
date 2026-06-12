@@ -6,6 +6,7 @@ Command-line interface for Outlook email operations using email IDs
 import sys
 import os
 import re
+import json
 import argparse
 from typing import Optional
 
@@ -58,6 +59,27 @@ def cmd_list_recent(args):
         else:
             emails, message = list_recent_emails_multi(days=args.days)
         email_count = len(emails)
+
+        if getattr(args, 'json', False):
+            serializable = []
+            for e in emails:
+                entry = {
+                    'entry_id': e.get('entry_id') or e.get('id', ''),
+                    'subject': e.get('subject', ''),
+                    'sender': e.get('sender', ''),
+                    'to_recipients': e.get('to_recipients', []),
+                    'cc_recipients': e.get('cc_recipients', []),
+                    'received_time': e.get('received_time', ''),
+                    'folder': e.get('folder_name', e.get('folder', '')),
+                    'has_attachments': e.get('has_attachments', False),
+                    'meeting_status': e.get('meeting_status', ''),
+                    'attachments_count': e.get('attachments_count', 0),
+                    'body_preview': e.get('body_preview', ''),
+                }
+                serializable.append(entry)
+            print(json.dumps(serializable, ensure_ascii=False))
+            return 0
+
         print(f"\n✅ Found {email_count} recent emails\n")
 
         if emails:
@@ -683,8 +705,8 @@ def _print_sent_entry_id(session, subject):
     """Retrieve and print EntryID of the most recently sent email."""
     import time
     from datetime import datetime, timedelta, timezone
-    threshold = datetime.now(timezone.utc) - timedelta(seconds=30)
-    for attempt in range(6):
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=90)
+    for attempt in range(15):
         time.sleep(2)
         try:
             ns = session.outlook.GetNamespace("MAPI")
@@ -692,19 +714,44 @@ def _print_sent_entry_id(session, subject):
             items = sent_folder.Items
             items.Sort("[SentOn]", True)
             item = items.GetFirst()
-            if item and item.SentOn.replace(tzinfo=timezone.utc) >= threshold:
+            if not item:
+                continue
+            sent_on = item.SentOn
+            if hasattr(sent_on, 'astimezone'):
+                sent_utc = sent_on.astimezone(timezone.utc)
+            else:
+                sent_utc = sent_on.replace(tzinfo=timezone.utc)
+            import re
+            bare_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', subject or '', flags=re.IGNORECASE)
+            bare_item_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', item.Subject or '', flags=re.IGNORECASE)
+            if sent_utc >= threshold and (not subject or bare_subject in bare_item_subject):
                 print(f"EntryID: {item.EntryID}")
                 return
         except Exception:
             pass
 
 
-def cmd_replyall(args):
-    """ReplyAll: keeps original To+CC. --to/--cc APPEND to existing.
+def _resolve_body(args, required=True):
+    """Resolve body from --body-file (preferred) or positional/flag body arg.
+    Returns True on success (args.body is set), False on error."""
+    body_file = getattr(args, 'body_file', None)
+    if body_file:
+        try:
+            with open(body_file, 'r', encoding='utf-8') as f:
+                args.body = f.read()
+        except Exception as e:
+            print(f"Error reading body file: {e}", file=sys.stderr)
+            return False
+    if required and not args.body:
+        print("Error: either body or --body-file is required.", file=sys.stderr)
+        return False
+    return True
 
-    Default reply behavior. Use for normal replies where you want
-    everyone kept in the loop.
-    """
+
+def cmd_reply(args):
+    """Reply to an email. Default: reply-all. --only: sender (From) only."""
+    if not _resolve_body(args):
+        return 1
     try:
         with OutlookSessionManager() as session:
             email_item = _get_email_item(session, args.email_id)
@@ -717,8 +764,21 @@ def cmd_replyall(args):
             parent_folder = email_item.Parent
             is_sent_items = "Sent Items" in parent_folder.Name or "已发送邮件" in parent_folder.Name
 
-            if is_sent_items:
-                # Sent Items: create new email with original recipients using SMTP addresses
+            if args.only:
+                # --only: reply to From (sender) only
+                if is_sent_items:
+                    reply = session.outlook.CreateItem(0)
+                    _add_recipients(reply, args.to, args.cc)
+                    reply.Display(False)
+                    signature_html = reply.HTMLBody
+                    original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
+                    reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
+                else:
+                    reply = email_item.Reply()
+                    _add_recipients(reply, args.to, args.cc)
+                    reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
+            elif is_sent_items:
+                # Sent Items: create new email with original recipients
                 reply = session.outlook.CreateItem(0)
                 for i in range(1, email_item.Recipients.Count + 1):
                     recip = email_item.Recipients.Item(i)
@@ -732,7 +792,7 @@ def cmd_replyall(args):
                 original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
                 reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
             else:
-                # Inbox: ReplyAll + append
+                # Default: ReplyAll
                 reply = email_item.ReplyAll()
                 _remove_self_from_recipients(reply, current_user_email)
                 _add_recipients(reply, args.to, args.cc)
@@ -751,61 +811,8 @@ def cmd_replyall(args):
             _set_importance(reply, args.importance)
             subject = reply.Subject
             reply.Send()
-            print(f"ReplyAll sent to {count} recipient(s)")
-            _print_sent_entry_id(session, subject)
-            return 0
-    except Exception as e:
-        print(f"Error: {str(e)}", file=sys.stderr)
-        return 1
-
-
-def cmd_reply(args):
-    """Reply (specify mode): --to/--cc specify EXACT extra recipients.
-
-    Uses Reply() — only goes to sender + specified extras.
-    For when you want to narrow the recipient list.
-    """
-    try:
-        with OutlookSessionManager() as session:
-            email_item = _get_email_item(session, args.email_id)
-
-            parent_folder = email_item.Parent
-            is_sent_items = "Sent Items" in parent_folder.Name or "已发送邮件" in parent_folder.Name
-
-            current_user = session.outlook.Session.CurrentUser
-            current_user_email = (
-                current_user.AddressEntry.GetExchangeUser().PrimarySmtpAddress
-                if current_user.AddressEntry.GetExchangeUser() else ""
-            )
-
-            if is_sent_items:
-                # Sent Items: new email with only specified recipients
-                reply = session.outlook.CreateItem(0)
-                _add_recipients(reply, args.to, args.cc)
-                reply.Display(False)
-                signature_html = reply.HTMLBody
-                original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
-                reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
-            else:
-                # Inbox: Reply (sender only) + specified extras
-                reply = email_item.Reply()
-                _add_recipients(reply, args.to, args.cc)
-                reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
-
-            reply.HTMLBody = _ensure_utf8_charset(reply.HTMLBody)
-            reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
-
-            if reply.Recipients.Count == 0:
-                print("Error: No recipients specified. Use --to or --cc.")
-                return 1
-
-            count = reply.Recipients.Count
-            _add_inline_images(reply, args.inline_image)
-            _add_attachments(reply, args.attach)
-            _set_importance(reply, args.importance)
-            subject = reply.Subject
-            reply.Send()
-            print(f"Reply sent to {count} recipient(s)")
+            mode = "Reply (From only)" if args.only else "Reply-all"
+            print(f"{mode} sent to {count} recipient(s)")
             _print_sent_entry_id(session, subject)
             return 0
     except Exception as e:
@@ -815,6 +822,8 @@ def cmd_reply(args):
 
 def cmd_compose(args):
     """Compose and send new email (always HTML format)"""
+    if not _resolve_body(args):
+        return 1
     try:
         to_list = [x.strip() for x in args.to.replace(";", ",").split(",")] if args.to else []
         cc_normalized = _normalize_cc(args.cc)
@@ -873,8 +882,9 @@ def cmd_batch_forward(args):
             with open(args.csv_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    if 'email' in row:
-                        recipients.append(row['email'].strip())
+                    row_lower = {k.lower(): v for k, v in row.items()}
+                    if 'email' in row_lower:
+                        recipients.append(row_lower['email'].strip())
             
             if not recipients:
                 print("Error: No email addresses found in CSV", file=sys.stderr)
@@ -908,7 +918,9 @@ def cmd_batch_forward(args):
             
             print(f"\nTotal recipients: {total_sent}")
             print(f"Successfully forwarded email: {email_subject}")
-        
+            fw_subject = f"FW: {email_subject}" if not email_subject.startswith("FW:") else email_subject
+            _print_sent_entry_id(session, fw_subject)
+
         return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -917,6 +929,8 @@ def cmd_batch_forward(args):
 
 def cmd_forward(args):
     """Forward an email to specified recipients with optional CC and custom message."""
+    if not _resolve_body(args, required=False):
+        return 1
     try:
         with OutlookSessionManager() as session:
             email_item = _get_email_item(session, args.email_id)
@@ -985,6 +999,8 @@ def cmd_forward(args):
 
 def cmd_redirect(args):
     """Redirect an email: clear all recipients, add new TO/CC, preserve original body."""
+    if not _resolve_body(args):
+        return 1
     try:
         with OutlookSessionManager() as session:
             email_item = _get_email_item(session, args.email_id)
@@ -1759,7 +1775,7 @@ def cmd_update_signature(args):
                     paragraphs.append(f'<p class=MsoNormal>{line}<o:p></o:p></p>')
                 else:
                     paragraphs.append(f'<p class=MsoNormal><o:p>&nbsp;</o:p></p>')
-            body_html = (line_end + line_end).join(paragraphs)
+            body_html = line_end.join(paragraphs)
 
             # Preserve original HTML template (head/styles) if backup exists
             bak_path = htm_path + '.bak'
@@ -1773,7 +1789,7 @@ def cmd_update_signature(args):
             div_pattern = _re.compile(r'(<div[^>]*>).*?(</div>)', _re.DOTALL)
             match = div_pattern.search(template)
             if match:
-                htm_content = template[:match.start(1)] + match.group(1) + line_end + line_end + body_html + line_end + line_end + match.group(2) + template[match.end(2):]
+                htm_content = template[:match.start(1)] + match.group(1) + line_end + body_html + line_end + match.group(2) + template[match.end(2):]
             else:
                 htm_content = (
                     '<html xmlns:o="urn:schemas-microsoft-com:office:office"\r\n'
@@ -1796,6 +1812,7 @@ def cmd_update_signature(args):
             print(f"✅ Signature '{name}' replaced from text.")
             print(f"   HTM: ✓ | TXT: ✓ | RTF: {'✓' if rtf_ok else '✗ (manual check needed)'}")
             print(f"   Backup: {htm_path}.bak")
+            print(f"   ⚠️ Restart Outlook for changes to take effect.")
             for line in lines:
                 print(f"   {line}")
 
@@ -1814,8 +1831,9 @@ def cmd_update_signature(args):
             with open(txt_path, 'w', encoding='utf-16') as f:
                 f.write(''.join(extractor.result))
             print(f"✅ Signature '{name}' replaced (full HTML body).")
-            print(f"   ⚠️ RTF not updated — restart Outlook may show old signature. Use --text mode for full update.")
+            print(f"   ⚠️ RTF not updated — use --text mode for full update.")
             print(f"   Backup: {htm_path}.bak")
+            print(f"   ⚠️ Restart Outlook for changes to take effect.")
 
         elif args.after and args.insert:
             htm_content = _read_sig_file(htm_path)
@@ -1835,9 +1853,9 @@ def cmd_update_signature(args):
             new_paragraphs = ''
             for line in args.insert.split('\\n'):
                 if line.strip():
-                    new_paragraphs += f'{line_end}{line_end}<p class=MsoNormal>{line}<o:p></o:p></p>'
+                    new_paragraphs += f'{line_end}<p class=MsoNormal>{line}<o:p></o:p></p>'
                 else:
-                    new_paragraphs += f'{line_end}{line_end}<p class=MsoNormal><o:p>&nbsp;</o:p></p>'
+                    new_paragraphs += f'{line_end}<p class=MsoNormal><o:p>&nbsp;</o:p></p>'
 
             htm_content = htm_content[:insert_point] + new_paragraphs + htm_content[insert_point:]
             with open(htm_path, 'w', encoding='utf-8') as f:
@@ -1880,6 +1898,7 @@ def cmd_update_signature(args):
             print(f"✅ Signature '{name}' updated (inserted after '{args.after}').")
             print(f"   Added: {insert_lines}")
             print(f"   Backup: {htm_path}.bak")
+            print(f"   ⚠️ Restart Outlook for changes to take effect.")
 
         elif args.find and args.replace is not None:
             htm_content = _read_sig_file(htm_path)
@@ -1908,6 +1927,7 @@ def cmd_update_signature(args):
             print(f"✅ Signature '{name}' updated ({count} replacement(s)).")
             print(f"   '{args.find}' → '{args.replace}'")
             print(f"   Backup: {htm_path}.bak")
+            print(f"   ⚠️ Restart Outlook for changes to take effect.")
         else:
             print("Error: provide --text, --body, --find/--replace, or --after/--insert.")
             return 1
@@ -1931,6 +1951,7 @@ def main():
     parser_list_recent = subparsers.add_parser('find-recent', help='Find recent emails with IDs')
     parser_list_recent.add_argument('--days', type=int, default=7, help='Days back to search (1-30)')
     parser_list_recent.add_argument('--folder', type=str, default=None, help='Folder name (default: Inbox)')
+    parser_list_recent.add_argument('--json', action='store_true', help='Output JSON for piping to email_sync.py')
     parser_list_recent.set_defaults(func=cmd_list_recent)
     
     # Search emails command
@@ -1957,33 +1978,25 @@ def main():
     parser_get_email.add_argument('email_id', help='Email ID from search results')
     parser_get_email.set_defaults(func=cmd_get_email)
     
-    # ReplyAll command (default — keeps everyone, --to/--cc append)
-    parser_replyall = subparsers.add_parser('replyall', help='Reply-all to an email (keeps original To+CC, --to/--cc append)')
-    parser_replyall.add_argument('email_id', help='Email ID from search results')
-    parser_replyall.add_argument('body', help='Reply text in HTML format')
-    parser_replyall.add_argument('--to', help='Additional To recipients (comma separated)')
-    parser_replyall.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
-    parser_replyall.add_argument('--attach', help='File path(s) to attach (comma separated)')
-    parser_replyall.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
-    parser_replyall.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
-    parser_replyall.set_defaults(func=cmd_replyall)
-
-    # Reply command (specify mode — sender only, --to/--cc specify extras)
-    parser_reply = subparsers.add_parser('reply', help='Reply to sender only (--to/--cc specify exact extras)')
+    # Reply command (default: reply-all; --only: sender only)
+    parser_reply = subparsers.add_parser('reply', help='Reply to email (default: reply-all; --only: From only)')
     parser_reply.add_argument('email_id', help='Email ID from search results')
-    parser_reply.add_argument('body', help='Reply text in HTML format')
-    parser_reply.add_argument('--to', help='Extra To recipients (comma separated)')
+    parser_reply.add_argument('body', nargs='?', default=None, help='Reply text in HTML format')
+    parser_reply.add_argument('--body-file', help='Read reply body from file (bypasses shell expansion)')
+    parser_reply.add_argument('--to', help='Additional To recipients (comma separated)')
     parser_reply.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_reply.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_reply.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_reply.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
+    parser_reply.add_argument('--only', action='store_true', help='Reply to From (sender) only instead of reply-all')
     parser_reply.set_defaults(func=cmd_reply)
     
     # Compose command
     parser_compose = subparsers.add_parser('compose', help='Compose and send new email')
     parser_compose.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_compose.add_argument('--subject', required=True, help='Email subject')
-    parser_compose.add_argument('--body', required=True, help='Email body')
+    parser_compose.add_argument('--body', help='Email body')
+    parser_compose.add_argument('--body-file', help='Read email body from file (bypasses shell expansion)')
     parser_compose.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_compose.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_compose.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
@@ -1996,6 +2009,7 @@ def main():
     parser_forward.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_forward.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_forward.add_argument('--body', help='Custom message to prepend')
+    parser_forward.add_argument('--body-file', help='Read message body from file (bypasses shell expansion)')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_forward.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_forward.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
@@ -2004,7 +2018,8 @@ def main():
     # Redirect command (clear all recipients, add new ones)
     parser_redirect = subparsers.add_parser('redirect', help='Redirect email: clear all recipients, set new TO/CC')
     parser_redirect.add_argument('email_id', help='Email ID from search results')
-    parser_redirect.add_argument('body', help='Message body in HTML format')
+    parser_redirect.add_argument('body', nargs='?', default=None, help='Message body in HTML format')
+    parser_redirect.add_argument('--body-file', help='Read message body from file (bypasses shell expansion)')
     parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_redirect.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')

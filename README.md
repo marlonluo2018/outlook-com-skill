@@ -162,28 +162,18 @@ py -3 scripts/outlook_skill.py compose --to "a@b.com" --subject "Urgent" --body 
 - Sends immediately when called
 - Outputs `EntryID: {ID}` after sending
 
-#### ReplyAll (Default Reply)
-
-```bash
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>HTML body</p>"
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>body</p>" --cc "extra@ibm.com"
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>body</p>" --attach "C:\file.pdf"
-py -3 scripts/outlook_skill.py replyall "<email_id>" "<p>body</p>" --importance high
-```
-
-Keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
-
-- `--importance`: Priority flag (`high` or `low`)
-- Outputs `EntryID: {ID}` after sending
-
-#### Reply (Sender Only)
+#### Reply
 
 ```bash
 py -3 scripts/outlook_skill.py reply "<email_id>" "<p>HTML body</p>"
-py -3 scripts/outlook_skill.py reply "<email_id>" "<p>body</p>" --to "specific@ibm.com"
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>body</p>" --cc "extra@ibm.com"
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>body</p>" --attach "C:\file.pdf"
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>body</p>" --importance high
+py -3 scripts/outlook_skill.py reply "<email_id>" "<p>body</p>" --only
 ```
 
-Replies to sender only. `--to`/`--cc` specify EXACT extra recipients (original To/CC NOT included).
+Default: reply-all (keeps ALL original To + CC). `--to`/`--cc` APPEND to existing.
+`--only`: reply to From (sender) only.
 
 - `--importance`: Priority flag (`high` or `low`)
 - Outputs `EntryID: {ID}` after sending
@@ -322,7 +312,7 @@ py -3 scripts/outlook_skill.py compose --to "user@example.com" --subject "Report
 
 - Format: `filepath:cid_name` (comma-separated for multiple)
 - Reference in HTML: `<img src="cid:cid_name">`
-- Works with: compose, reply, replyall, forward, redirect
+- Works with: compose, reply, forward, redirect
 
 ---
 

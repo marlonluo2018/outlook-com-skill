@@ -60,6 +60,7 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
             "attachments_count": len(attachments),
             "embedded_images_count": embedded_images_count,
             "embedded_images": embedded_images,
+            "body_preview": item_data.get('body_preview', ''),
             "unread": item_data.get('UnRead', False)
         }
     except Exception as e:
@@ -74,6 +75,7 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
             "has_attachments": False,
             "attachments": [],
             "attachments_count": 0,
+            "body_preview": "",
             "unread": False
         }
 
@@ -98,6 +100,11 @@ def extract_emails_parallel(items: List[Any], max_workers: int = 4) -> List[Dict
         item_dicts = []
         for item in items:
             try:
+                raw_body = ''
+                try:
+                    raw_body = getattr(item, 'Body', '') or ''
+                except Exception:
+                    pass
                 item_dict = {
                     'EntryID': getattr(item, 'EntryID', ''),
                     'Subject': getattr(item, 'Subject', 'No Subject'),
@@ -105,7 +112,8 @@ def extract_emails_parallel(items: List[Any], max_workers: int = 4) -> List[Dict
                     'ReceivedTime': getattr(item, 'ReceivedTime', None),
                     'To': getattr(item, 'To', ''),
                     'CC': getattr(item, 'CC', ''),
-                    'UnRead': getattr(item, 'UnRead', False)
+                    'UnRead': getattr(item, 'UnRead', False),
+                    'body_preview': raw_body[:200].strip()
                 }
                 
                 # Extract attachment info with embedded image detection
@@ -324,7 +332,15 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
             
             # Extract unread status
             unread = getattr(item, 'UnRead', False)
-            
+
+            # Body preview for quick scope judgment
+            body_preview = ""
+            try:
+                raw_body = getattr(item, 'Body', '') or ''
+                body_preview = raw_body[:200].strip()
+            except Exception:
+                pass
+
             email_data = {
                 "entry_id": entry_id,
                 "subject": subject,
@@ -337,6 +353,7 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
                 "attachments_count": len(attachments),
                 "embedded_images_count": embedded_images_count,
                 "embedded_images": embedded_images_list,
+                "body_preview": body_preview,
                 "unread": unread
             }
             
