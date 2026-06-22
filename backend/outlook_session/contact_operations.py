@@ -121,6 +121,9 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
     """
     Look up contacts by display name via Exchange GAL.
 
+    Always searches the GAL to return ALL matching contacts,
+    not just the first resolved match.
+
     Args:
         display_name: The display name to search for (e.g., "HONG YANG")
 
@@ -129,33 +132,6 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
     """
     try:
         with OutlookSessionManager() as session:
-            recipient = session.outlook.Session.CreateRecipient(display_name)
-            recipient.Resolve()
-
-            if recipient.Resolved:
-                address_entry = recipient.AddressEntry
-                exchange_user = address_entry.GetExchangeUser()
-
-                if exchange_user:
-                    return [_extract_exchange_user_info(exchange_user)]
-                else:
-                    return [{
-                        'display_name': address_entry.Name,
-                        'email': address_entry.Address,
-                        'first_name': None,
-                        'last_name': None,
-                        'company': None,
-                        'job_title': None,
-                        'department': None,
-                        'office': None,
-                        'business_phone': None,
-                        'mobile_phone': None,
-                        'city': None,
-                        'state': None,
-                        'alias': None,
-                    }]
-
-            # Ambiguous or not found — search GAL directly
             namespace = session.outlook_namespace
             gal = None
             for al in namespace.AddressLists:
@@ -164,32 +140,93 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
                     break
 
             if not gal:
-                return []
+                logger.debug("GAL not found, falling back to single resolve")
+                return _resolve_single_contact(session, display_name)
 
             results = []
+            seen_emails = set()
             search_upper = display_name.upper()
-            try:
-                entries = gal.AddressEntries
-                entry = entries.Item(display_name)
+            entries = gal.AddressEntries
+
+            def _collect_from_position(start_name):
+                """Jump to a GAL position and collect consecutive matches."""
+                try:
+                    entry = entries.Item(start_name)
+                except Exception:
+                    return
                 while entry:
                     if search_upper in entry.Name.upper():
                         try:
                             exchange_user = entry.GetExchangeUser()
                             if exchange_user:
-                                results.append(_extract_exchange_user_info(exchange_user))
+                                info = _extract_exchange_user_info(exchange_user)
+                                email_key = (info.get('email') or '').lower()
+                                if email_key and email_key not in seen_emails:
+                                    seen_emails.add(email_key)
+                                    results.append(info)
                         except Exception:
                             pass
                     else:
                         break
                     entry = entries.GetNext()
-            except Exception as e:
-                logger.debug(f"GAL search error: {e}")
 
-            return results
+            _collect_from_position(display_name)
+            prev_count = len(results)
+            max_iterations = 50
+            iteration = 0
+            while iteration < max_iterations:
+                iteration += 1
+                if not results and prev_count == 0:
+                    break
+                last_name = results[-1]['display_name'] if results else display_name
+                next_prefix = last_name + "a"
+                _collect_from_position(next_prefix)
+                if len(results) == prev_count:
+                    break
+                prev_count = len(results)
+
+            if results:
+                return results
+
+            return _resolve_single_contact(session, display_name)
 
     except Exception as e:
         logger.error(f"Error looking up contact by name: {e}")
         return []
+
+
+def _resolve_single_contact(session, display_name: str) -> List[Dict[str, Any]]:
+    """Fallback: resolve a single contact via CreateRecipient."""
+    try:
+        recipient = session.outlook.Session.CreateRecipient(display_name)
+        recipient.Resolve()
+
+        if recipient.Resolved:
+            address_entry = recipient.AddressEntry
+            exchange_user = address_entry.GetExchangeUser()
+
+            if exchange_user:
+                return [_extract_exchange_user_info(exchange_user)]
+            else:
+                return [{
+                    'display_name': address_entry.Name,
+                    'email': address_entry.Address,
+                    'first_name': None,
+                    'last_name': None,
+                    'company': None,
+                    'job_title': None,
+                    'department': None,
+                    'office': None,
+                    'business_phone': None,
+                    'mobile_phone': None,
+                    'city': None,
+                    'state': None,
+                    'alias': None,
+                }]
+    except Exception as e:
+        logger.debug(f"Single resolve fallback error: {e}")
+
+    return []
 
 
 def get_display_name_from_email(email_address: str) -> Optional[str]:
