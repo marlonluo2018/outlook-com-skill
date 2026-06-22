@@ -156,9 +156,17 @@ def _search_single_folder(
                         searchable_parts.append(getattr(item, 'Subject', '') or '')
                     elif search_type == "sender":
                         searchable_parts.append(getattr(item, 'SenderName', '') or '')
-                        searchable_parts.append(
-                            getattr(item, 'SenderEmailAddress', '') or ''
-                        )
+                        sender_email = getattr(item, 'SenderEmailAddress', '') or ''
+                        searchable_parts.append(sender_email)
+                        if '@' not in sender_email and hasattr(item, 'PropertyAccessor'):
+                            try:
+                                smtp = item.PropertyAccessor.GetProperty(
+                                    "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+                                )
+                                if smtp:
+                                    searchable_parts.append(smtp)
+                            except Exception:
+                                pass
                     elif search_type == "recipient":
                         searchable_parts.append(getattr(item, 'To', '') or '')
                         searchable_parts.append(getattr(item, 'CC', '') or '')

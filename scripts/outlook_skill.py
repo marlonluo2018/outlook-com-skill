@@ -10,7 +10,9 @@ import json
 import argparse
 from typing import Optional
 
-# Force UTF-8 for stdout and stderr on Windows
+# Force UTF-8 for stdin, stdout and stderr on Windows
+if sys.stdin and hasattr(sys.stdin, 'reconfigure') and sys.stdin.encoding != 'utf-8':
+    sys.stdin.reconfigure(encoding='utf-8')
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 if sys.stderr.encoding != 'utf-8':
@@ -379,22 +381,37 @@ def cmd_search(args):
 def cmd_get_email(args):
     """Get full email details by ID"""
     try:
+        email_id = args.email_id or getattr(args, 'email_id_flag', None)
+        if not email_id:
+            print("Error: email_id is required (positional or --id)", file=sys.stderr)
+            return 1
         with OutlookSessionManager() as session:
-            email_item = _get_email_item(session, args.email_id)
+            email_item = _get_email_item(session, email_id)
 
-            print("\nFull email details:")
-            print(f"ID: {args.email_id}")
-            print(f"Subject: {email_item.Subject}")
-            print(f"From: {email_item.SenderName} <{email_item.SenderEmailAddress}>")
-            if email_item.To:
-                print(f"To: {email_item.To}")
-            if email_item.CC:
-                print(f"CC: {email_item.CC}")
-            rt = getattr(email_item, 'ReceivedTime', None)
-            print(f"Date: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
-            print(f"\nBody:\n{email_item.Body}")
+            fields = None
+            if getattr(args, 'fields', None):
+                fields = set(f.strip().lower() for f in args.fields.split(','))
 
-            if email_item.Attachments.Count > 0:
+            if not fields:
+                print("\nFull email details:")
+                print(f"ID: {email_id}")
+            if not fields or 'subject' in fields:
+                print(f"Subject: {email_item.Subject}")
+            if not fields or 'from' in fields:
+                print(f"From: {email_item.SenderName} <{email_item.SenderEmailAddress}>")
+            if not fields or 'to' in fields:
+                if email_item.To:
+                    print(f"To: {email_item.To}")
+            if not fields or 'cc' in fields:
+                if email_item.CC:
+                    print(f"CC: {email_item.CC}")
+            if not fields or 'date' in fields:
+                rt = getattr(email_item, 'ReceivedTime', None)
+                print(f"Date: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
+            if not fields or 'body' in fields:
+                print(f"\nBody:\n{email_item.Body}")
+
+            if (not fields or 'body' in fields) and email_item.Attachments.Count > 0:
                 regular = []
                 embedded = []
                 for i in range(1, email_item.Attachments.Count + 1):
@@ -412,7 +429,7 @@ def cmd_get_email(args):
 
                 if embedded:
                     import tempfile
-                    temp_dir = os.path.join(tempfile.gettempdir(), "outlook_inline", args.email_id[:16])
+                    temp_dir = os.path.join(tempfile.gettempdir(), "outlook_inline", email_id[:16])
                     os.makedirs(temp_dir, exist_ok=True)
                     print(f"\n\U0001F5BC  Embedded images (auto-saved):")
                     used_names = set()
@@ -482,6 +499,33 @@ def _add_attachments(mail_item, attach_str):
         mail_item.Attachments.Add(filepath)
 
 
+def _attach_emails(mail_item, attach_email_str, session):
+    """Attach other emails as .msg files to a mail item."""
+    if not attach_email_str:
+        return
+    import os, tempfile
+    temp_files = []
+    for eid in attach_email_str.split(","):
+        eid = eid.strip().strip('"')
+        if not eid:
+            continue
+        try:
+            source = _get_email_item(session, eid)
+            subject = str(getattr(source, "Subject", "email"))[:50]
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in subject)
+            temp_path = os.path.join(tempfile.gettempdir(), f"{safe_name}.msg")
+            source.SaveAs(temp_path, 3)  # olMSG
+            mail_item.Attachments.Add(temp_path)
+            temp_files.append(temp_path)
+        except Exception as e:
+            print(f"WARNING: Could not attach email {eid[:20]}...: {e}")
+    for f in temp_files:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
 def _set_importance(mail_item, importance_str):
     """Set email importance/priority flag. Values: high, low, normal (default)."""
     if not importance_str:
@@ -521,6 +565,16 @@ def _add_inline_images(mail_item, inline_str):
             continue
         if not cid:
             cid = os.path.basename(filepath).replace(" ", "_")
+        # Remove existing attachments with the same CID (e.g. from forwarded emails)
+        for i in range(mail_item.Attachments.Count, 0, -1):
+            try:
+                existing_cid = mail_item.Attachments.Item(i).PropertyAccessor.GetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+                )
+                if existing_cid == cid:
+                    mail_item.Attachments.Remove(i)
+            except Exception:
+                pass
         attachment = mail_item.Attachments.Add(filepath)
         attachment.PropertyAccessor.SetProperty(
             "http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid
@@ -593,9 +647,12 @@ def _wrap_body_font(html_body: str) -> str:
 
 
 def _format_forward_message_html(message_text: str) -> str:
-    """Convert plain text or HTML-ish input into the simple prepended block used for forwards."""
+    """Convert plain text or HTML-ish input into the simple prepended block used for forwards.
+    If input already contains HTML tags, pass through as-is (no <p> wrapping)."""
     if not message_text:
         return ""
+    if re.search(r'<[a-zA-Z][^>]*>', message_text):
+        return _wrap_body_font(message_text)
     inner = '<p>' + message_text.replace('\n\n', '</p><p>').replace('\n', '<br>') + '</p>'
     return _wrap_body_font(inner)
 
@@ -732,18 +789,17 @@ def _print_sent_entry_id(session, subject):
 
 
 def _resolve_body(args, required=True):
-    """Resolve body from --body-file (preferred) or positional/flag body arg.
+    """Resolve body from --body-stdin or positional/flag body arg.
+    Priority: stdin > positional arg.
     Returns True on success (args.body is set), False on error."""
-    body_file = getattr(args, 'body_file', None)
-    if body_file:
-        try:
-            with open(body_file, 'r', encoding='utf-8') as f:
-                args.body = f.read()
-        except Exception as e:
-            print(f"Error reading body file: {e}", file=sys.stderr)
+    if getattr(args, 'body_stdin', False):
+        if not sys.stdin.isatty():
+            args.body = sys.stdin.read()
+        else:
+            print("Error: --body-stdin specified but no piped input detected.", file=sys.stderr)
             return False
     if required and not args.body:
-        print("Error: either body or --body-file is required.", file=sys.stderr)
+        print("Error: body or --body-stdin is required.", file=sys.stderr)
         return False
     return True
 
@@ -808,6 +864,7 @@ def cmd_reply(args):
             count = reply.Recipients.Count
             _add_inline_images(reply, args.inline_image)
             _add_attachments(reply, args.attach)
+            _attach_emails(reply, args.attach_email, session)
             _set_importance(reply, args.importance)
             subject = reply.Subject
             reply.Send()
@@ -850,6 +907,7 @@ def cmd_compose(args):
 
             _add_inline_images(mail, args.inline_image)
             _add_attachments(mail, args.attach)
+            _attach_emails(mail, args.attach_email, session)
             _set_importance(mail, args.importance)
             mail.Send()
             total_recipients = len(to_list) + len(cc_list)
@@ -891,35 +949,72 @@ def cmd_batch_forward(args):
                 return 1
             
             # Forward to recipients in batches (batch size from config file)
+            import time
+            from datetime import datetime, timezone
             total_sent = 0
-            
+            num_batches = (len(recipients) + batch_size - 1) // batch_size
+            send_start_time = datetime.now(timezone.utc)
+
             for i in range(0, len(recipients), batch_size):
                 batch = recipients[i:i + batch_size]
-                
+                batch_num = i // batch_size + 1
+
                 # Create forward
                 forward = email_item.Forward()
-                
+
                 # Add custom message if provided (insert into body tag like reply does)
                 if args.message:
                     forward.HTMLBody = _format_forward_message_html(args.message) + forward.HTMLBody
-                
+
                 # Add recipients as BCC (to protect privacy)
                 for recipient in batch:
                     bcc_recip = forward.Recipients.Add(recipient)
                     bcc_recip.Type = 3  # 3 = olBCC
-                
+
                 # Resolve all recipients before sending
                 forward.Recipients.ResolveAll()
-                
+
                 # Send
                 forward.Send()
                 total_sent += len(batch)
-                print(f"Sent batch {i//batch_size + 1}: {len(batch)} recipients")
-            
+                print(f"Sent batch {batch_num}/{num_batches}: {len(batch)} recipients")
+
             print(f"\nTotal recipients: {total_sent}")
             print(f"Successfully forwarded email: {email_subject}")
+
+            # Retrieve EntryIDs for all sent batches
             fw_subject = f"FW: {email_subject}" if not email_subject.startswith("FW:") else email_subject
-            _print_sent_entry_id(session, fw_subject)
+            import re
+            bare_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', fw_subject or '', flags=re.IGNORECASE)
+            threshold = send_start_time
+
+            for attempt in range(15):
+                time.sleep(2)
+                try:
+                    ns = session.outlook.GetNamespace("MAPI")
+                    sent_folder = ns.GetDefaultFolder(5)
+                    items = sent_folder.Items
+                    items.Sort("[SentOn]", True)
+                    found_ids = []
+                    item = items.GetFirst()
+                    while item and len(found_ids) < num_batches:
+                        sent_on = item.SentOn
+                        if hasattr(sent_on, 'astimezone'):
+                            sent_utc = sent_on.astimezone(timezone.utc)
+                        else:
+                            sent_utc = sent_on.replace(tzinfo=timezone.utc)
+                        if sent_utc < threshold:
+                            break
+                        bare_item_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', item.Subject or '', flags=re.IGNORECASE)
+                        if bare_subject in bare_item_subject:
+                            found_ids.append(item.EntryID)
+                        item = items.GetNext()
+                    if len(found_ids) >= num_batches:
+                        for idx, eid in enumerate(reversed(found_ids), 1):
+                            print(f"EntryID (batch {idx}): {eid}")
+                        break
+                except Exception:
+                    pass
 
         return 0
     except Exception as e:
@@ -941,9 +1036,12 @@ def cmd_forward(args):
             while forward.Recipients.Count > 0:
                 forward.Recipients.Remove(1)
 
-            # Set subject with FW: prefix
+            # Set subject: use --subject override or default FW: prefix
             original_subject = str(getattr(email_item, "Subject", "No Subject"))
-            forward.Subject = f"FW: {original_subject}" if not original_subject.startswith("FW:") else original_subject
+            if getattr(args, 'subject', None):
+                forward.Subject = args.subject
+            else:
+                forward.Subject = f"FW: {original_subject}" if not original_subject.startswith("FW:") else original_subject
 
             # Add To recipients
             if args.to:
@@ -986,6 +1084,7 @@ def cmd_forward(args):
 
             _add_inline_images(forward, args.inline_image)
             _add_attachments(forward, args.attach)
+            _attach_emails(forward, args.attach_email, session)
             _set_importance(forward, args.importance)
             forward.Send()
             print(f"Forward sent to {recipient_count} recipient(s)")
@@ -1974,18 +2073,21 @@ def main():
     parser_search.set_defaults(func=cmd_search)
     
     # Get email command
-    parser_get_email = subparsers.add_parser('get-email', help='Get full email details by ID')
-    parser_get_email.add_argument('email_id', help='Email ID from search results')
+    parser_get_email = subparsers.add_parser('get-email', aliases=['read'], help='Get full email details by ID')
+    parser_get_email.add_argument('email_id', nargs='?', default=None, help='Email ID from search results')
+    parser_get_email.add_argument('--id', dest='email_id_flag', help='Email ID (alternative to positional)')
+    parser_get_email.add_argument('--fields', help='Comma-separated fields to show (from,to,cc,subject,date,body)')
     parser_get_email.set_defaults(func=cmd_get_email)
     
     # Reply command (default: reply-all; --only: sender only)
     parser_reply = subparsers.add_parser('reply', help='Reply to email (default: reply-all; --only: From only)')
     parser_reply.add_argument('email_id', help='Email ID from search results')
     parser_reply.add_argument('body', nargs='?', default=None, help='Reply text in HTML format')
-    parser_reply.add_argument('--body-file', help='Read reply body from file (bypasses shell expansion)')
+    parser_reply.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_reply.add_argument('--to', help='Additional To recipients (comma separated)')
     parser_reply.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_reply.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_reply.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
     parser_reply.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_reply.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_reply.add_argument('--only', action='store_true', help='Reply to From (sender) only instead of reply-all')
@@ -1996,9 +2098,10 @@ def main():
     parser_compose.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_compose.add_argument('--subject', required=True, help='Email subject')
     parser_compose.add_argument('--body', help='Email body')
-    parser_compose.add_argument('--body-file', help='Read email body from file (bypasses shell expansion)')
+    parser_compose.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_compose.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_compose.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_compose.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
     parser_compose.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_compose.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_compose.set_defaults(func=cmd_compose)
@@ -2009,17 +2112,19 @@ def main():
     parser_forward.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_forward.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_forward.add_argument('--body', help='Custom message to prepend')
-    parser_forward.add_argument('--body-file', help='Read message body from file (bypasses shell expansion)')
+    parser_forward.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
+    parser_forward.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
     parser_forward.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_forward.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
+    parser_forward.add_argument('--subject', help='Override the forwarded subject (default: FW: <original>)')
     parser_forward.set_defaults(func=cmd_forward)
 
     # Redirect command (clear all recipients, add new ones)
     parser_redirect = subparsers.add_parser('redirect', help='Redirect email: clear all recipients, set new TO/CC')
     parser_redirect.add_argument('email_id', help='Email ID from search results')
     parser_redirect.add_argument('body', nargs='?', default=None, help='Message body in HTML format')
-    parser_redirect.add_argument('--body-file', help='Read message body from file (bypasses shell expansion)')
+    parser_redirect.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_redirect.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')

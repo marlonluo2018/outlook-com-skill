@@ -112,11 +112,11 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 
 ### Reply
 ```bash
-py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html"
-py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --cc "extra@ibm.com"
-py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --attach "C:\path\file.pdf"
-py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --importance high
-py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html" --only
+echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin
+echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --cc "extra@ibm.com"
+echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --attach "C:\path\file.pdf"
+echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --importance high
+echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --only
 ```
 - **Default: reply-all** — keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
 - **`--only`: reply to From (sender) only** — use only when user explicitly asks to narrow
@@ -126,10 +126,10 @@ py -3 scripts/outlook_skill.py reply "<email_id>" --body-file "C:\temp\body.html
 
 ### Compose Email
 ```bash
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html"
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html" --attach "C:\path\file.pdf"
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html" --importance high
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file "C:\temp\body.html" --inline-image "C:\path\img.png:pic1"
+echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin
+echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin --attach "C:\path\file.pdf"
+echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin --importance high
+echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin --inline-image "C:\path\img.png:pic1"
 ```
 - `--attach`: File path(s) to attach (comma separated for multiple)
 - `--inline-image`: Embed image inline via CID (format: `filepath:cid_name`, comma separated)
@@ -142,13 +142,13 @@ py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-file
 ### Forward (single)
 ```bash
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com"
-py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com,user2@ibm.com" --cc "manager@ibm.com" --body-file "C:\temp\body.html"
+echo "<body>" | py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com,user2@ibm.com" --cc "manager@ibm.com" --body-stdin
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com" --attach "C:\path\file.pdf"
 ```
 - Forwards an email to specified recipients
 - `--to` (required): Comma-separated list of To recipients
 - `--cc` (optional): Comma-separated list of CC recipients
-- `--body-file` (preferred) or `--body` (optional): Custom HTML message to prepend
+- `--body-stdin` or `--body` (optional): Custom HTML message to prepend
 - `--attach` (optional): File path(s) to attach (comma separated for multiple)
 - Subject auto-prefixed with `FW:`
 - Preserves original email formatting
@@ -167,12 +167,12 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 
 ### Redirect (Clear Recipients + New TO/CC)
 ```bash
-py -3 scripts/outlook_skill.py redirect "<email_id>" --body-file "C:\temp\body.html" --to "a@b.com,c@d.com"
-py -3 scripts/outlook_skill.py redirect "<email_id>" --body-file "C:\temp\body.html" --to "a@b.com" --cc "b@b.com"
+echo "<body>" | py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com,c@d.com" --body-stdin
+echo "<body>" | py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com" --cc "b@b.com" --body-stdin
 ```
 - Clears all existing TO and CC recipients, then adds new ones
 - Preserves original email body as quoted content (like forward)
-- `--body-file` (preferred) or positional `body`: HTML message prepended above original content
+- `--body-stdin` or positional `body`: HTML message prepended above original content
 - `--to` (required): New TO recipients (comma separated)
 - `--cc`: New CC recipients (comma separated)
 - `--attach`: File path(s) to attach (comma separated)
@@ -317,24 +317,46 @@ class BatchConfig:
 <p>Best regards,<br>Marlon</p>
 ```
 
+**Lists — NO `<ul><li>`:** Outlook adds excessive spacing between list items. Use `<br>` with bullet characters:
+
+```html
+<!-- ✅ CORRECT -->
+<p>• Item one<br>
+• Item two<br>
+• Item three</p>
+
+<!-- ❌ WRONG: huge gaps in Outlook -->
+<ul><li>Item one</li><li>Item two</li></ul>
+```
+
 ## ⚠️ Special Characters in Email Body
 
-**CRITICAL:** Always use `--body-file` to pass email body content. This bypasses shell variable expansion (`$0`, `$1`, `$VAR` etc. would be interpreted by bash if passed inline).
+**CRITICAL:** Always use `--body-stdin` with a **heredoc** to pass email body content. A heredoc with quoted delimiter (`<<'EOF'`) prevents ALL shell variable expansion and handles any character safely.
 
 **Mandatory workflow:**
-1. Write HTML body to a temp file: `./downloads/temp_body.html`
-2. Pass via `--body-file "./downloads/temp_body.html"`
-3. The file is read by Python directly — no shell expansion occurs
+1. Use heredoc with quoted `'EOF'` to pipe body — this prevents `$0`, `$VAR`, backticks, etc. from being interpreted by bash
+2. Python reads from stdin — no shell expansion, no temp file
 
 ```bash
-# ✅ CORRECT: body in file, $ signs preserved
-py -3 scripts/outlook_skill.py reply "<id>" --body-file "./downloads/temp_body.html"
+# ✅ CORRECT: heredoc with quoted delimiter, $ signs preserved
+cat <<'EOF' | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
+<p>Cost: $80,000 — this preserves $0, $VAR, and all special chars</p>
+EOF
 
-# ❌ WRONG: inline body, $ signs eaten by bash
+# ❌ WRONG: double-quoted echo — bash expands $0 to shell name, $8 to empty
+echo "Cost: $80,000" | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
+
+# ❌ WRONG: inline body arg — same expansion problem
 py -3 scripts/outlook_skill.py reply "<id>" "Cost: $80,000"
 ```
 
-**Fallback (if --body-file unavailable):** Replace `$` with `&#36;` in inline body args.
+**Why not single quotes?** `echo '...'` works for `$` but breaks if the body contains apostrophes (`I'm`, `don't`). Heredoc handles both.
+
+**Fallback (if heredoc unavailable):** Replace `$` with `&#36;` in the body text.
+
+### Non-ASCII Characters (UTF-8)
+
+The script reconfigures stdin to UTF-8, so em dashes (`—`), curly quotes, and other non-ASCII characters are supported in `--body-stdin` bodies. No special handling needed — just pipe normally via `echo "..." | py -3 ...`.
 
 ## Find Workflow for Email Addresses
 
