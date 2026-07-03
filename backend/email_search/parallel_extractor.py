@@ -16,6 +16,21 @@ logger = get_logger(__name__)
 # Thread-local storage for COM objects
 _thread_local = threading.local()
 
+_MAPI_START_PROP = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820D0040'
+_MAPI_END_PROP = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820E0040'
+
+
+def _meeting_status_label(raw: int) -> str:
+    """Convert raw MeetingStatus int to string label matching search_common convention."""
+    if raw == 3:
+        return "meeting_request"
+    elif raw in (5, 7):
+        return "meeting_canceled"
+    elif raw == 1:
+        return "meeting"
+    return ""
+
+
 def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract email info from item data in a thread-safe manner."""
     try:
@@ -48,11 +63,29 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
         embedded_images_count = item_data.get('embedded_images_count', 0)
         embedded_images = item_data.get('embedded_images', [])
 
+        start_time = item_data.get('Start', None)
+        start_str = ""
+        if start_time:
+            try:
+                start_str = str(start_time.replace(tzinfo=None))
+            except Exception:
+                start_str = str(start_time) if start_time else ""
+
+        end_time = item_data.get('End', None)
+        end_str = ""
+        if end_time:
+            try:
+                end_str = str(end_time.replace(tzinfo=None))
+            except Exception:
+                end_str = str(end_time) if end_time else ""
+
         return {
             "entry_id": entry_id,
             "subject": subject,
             "sender": sender,
             "received_time": str(received_time.replace(tzinfo=None)) if received_time else "Unknown",
+            "start_time": start_str,
+            "end_time": end_str,
             "to_recipients": to_recipients,
             "cc_recipients": cc_recipients,
             "has_attachments": has_attachments,
@@ -61,7 +94,9 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
             "embedded_images_count": embedded_images_count,
             "embedded_images": embedded_images,
             "body_preview": item_data.get('body_preview', ''),
-            "unread": item_data.get('UnRead', False)
+            "unread": item_data.get('UnRead', False),
+            "message_class": item_data.get('MessageClass', ''),
+            "meeting_status": _meeting_status_label(item_data.get('MeetingStatus', 0)),
         }
     except Exception as e:
         logger.debug(f"Error in parallel extraction: {e}")
@@ -105,14 +140,38 @@ def extract_emails_parallel(items: List[Any], max_workers: int = 4) -> List[Dict
                     raw_body = getattr(item, 'Body', '') or ''
                 except Exception:
                     pass
+                try:
+                    to_val = getattr(item, 'To', '') or ''
+                except Exception:
+                    to_val = ''
+                try:
+                    cc_val = getattr(item, 'CC', '') or ''
+                except Exception:
+                    cc_val = ''
+
+                start_val = None
+                end_val = None
+                try:
+                    msg_class = getattr(item, 'MessageClass', '') or ''
+                    if 'Schedule' in msg_class or getattr(item, 'MeetingStatus', 0):
+                        pa = item.PropertyAccessor
+                        start_val = pa.GetProperty(_MAPI_START_PROP)
+                        end_val = pa.GetProperty(_MAPI_END_PROP)
+                except Exception:
+                    pass
+
                 item_dict = {
                     'EntryID': getattr(item, 'EntryID', ''),
                     'Subject': getattr(item, 'Subject', 'No Subject'),
                     'SenderName': getattr(item, 'SenderName', 'Unknown'),
                     'ReceivedTime': getattr(item, 'ReceivedTime', None),
-                    'To': getattr(item, 'To', ''),
-                    'CC': getattr(item, 'CC', ''),
+                    'Start': start_val,
+                    'End': end_val,
+                    'To': to_val,
+                    'CC': cc_val,
                     'UnRead': getattr(item, 'UnRead', False),
+                    'MessageClass': getattr(item, 'MessageClass', ''),
+                    'MeetingStatus': getattr(item, 'MeetingStatus', 0),
                     'body_preview': raw_body[:200].strip()
                 }
                 
@@ -242,9 +301,15 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
             received_time = getattr(item, 'ReceivedTime', None)
             received_str = str(received_time.replace(tzinfo=None)) if received_time else "Unknown"
             
-            # Extract recipient information
-            to_field = getattr(item, 'To', '')
-            cc_field = getattr(item, 'CC', '')
+            # Extract recipient information (To/CC can throw on meeting items)
+            try:
+                to_field = getattr(item, 'To', '') or ''
+            except Exception:
+                to_field = ''
+            try:
+                cc_field = getattr(item, 'CC', '') or ''
+            except Exception:
+                cc_field = ''
             
             # Parse recipients from To field
             to_recipients = []
@@ -341,11 +406,30 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
             except Exception:
                 pass
 
+            message_class = getattr(item, 'MessageClass', '') or ''
+            meeting_status_raw = getattr(item, 'MeetingStatus', 0) or 0
+
+            start_str = ""
+            end_str = ""
+            try:
+                if 'Schedule' in message_class or meeting_status_raw:
+                    pa = item.PropertyAccessor
+                    start_val = pa.GetProperty(_MAPI_START_PROP)
+                    if start_val:
+                        start_str = str(start_val.replace(tzinfo=None))
+                    end_val = pa.GetProperty(_MAPI_END_PROP)
+                    if end_val:
+                        end_str = str(end_val.replace(tzinfo=None))
+            except Exception:
+                pass
+
             email_data = {
                 "entry_id": entry_id,
                 "subject": subject,
                 "sender": sender,
                 "received_time": received_str,
+                "start_time": start_str,
+                "end_time": end_str,
                 "to_recipients": to_recipients,
                 "cc_recipients": cc_recipients,
                 "has_attachments": has_attachments,
@@ -354,7 +438,9 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
                 "embedded_images_count": embedded_images_count,
                 "embedded_images": embedded_images_list,
                 "body_preview": body_preview,
-                "unread": unread
+                "unread": unread,
+                "message_class": message_class,
+                "meeting_status": _meeting_status_label(meeting_status_raw),
             }
             
             if hasattr(items, '__len__'):

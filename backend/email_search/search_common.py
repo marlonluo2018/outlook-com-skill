@@ -217,6 +217,7 @@ def extract_email_info_minimal(item) -> Dict[str, Any]:
             "folder": _get_folder_name(item),
             "conversation_id": _get_conversation_id(item),
             "meeting_status": _get_meeting_status(item),
+            "message_class": getattr(item, 'MessageClass', ''),
             "to_recipients": to_recipients,
             "cc_recipients": cc_recipients,
             "has_attachments": has_attachments,
@@ -310,6 +311,8 @@ def extract_email_info(item) -> Dict[str, Any]:
         folder_name = _get_folder_name(item)
         conversation_id = _get_conversation_id(item)
 
+        message_class = getattr(item, 'MessageClass', '')
+
         email_info = {
             "entry_id": entry_id,
             "subject": subject,
@@ -318,6 +321,7 @@ def extract_email_info(item) -> Dict[str, Any]:
             "folder": folder_name,
             "conversation_id": conversation_id,
             "meeting_status": _get_meeting_status(item),
+            "message_class": message_class,
         }
 
         # Cache these attributes for recipient processing

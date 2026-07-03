@@ -21,6 +21,19 @@ def _extract_exchange_user_info(exchange_user) -> Dict[str, Any]:
         except Exception:
             return None
 
+    manager_info = None
+    try:
+        mgr = exchange_user.GetExchangeUserManager()
+        if mgr:
+            manager_info = {
+                'display_name': mgr.Name,
+                'email': mgr.PrimarySmtpAddress,
+                'job_title': getattr(mgr, 'JobTitle', None) or None,
+                'department': getattr(mgr, 'Department', None) or None,
+            }
+    except Exception:
+        pass
+
     return {
         'display_name': _safe_get('Name'),
         'email': _safe_get('PrimarySmtpAddress'),
@@ -35,6 +48,7 @@ def _extract_exchange_user_info(exchange_user) -> Dict[str, Any]:
         'city': _safe_get('City'),
         'state': _safe_get('StateOrProvince'),
         'alias': _safe_get('Alias'),
+        'manager': manager_info,
     }
 
 

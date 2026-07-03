@@ -15,8 +15,10 @@ triggers: [
   "lookup contact", "who is",
   "use as template", "edit email html", "modify email", "create from template",
   "get signature", "view signature", "update signature", "change signature",
+  "calendar", "show calendar", "my schedule", "what meetings",
+  "accept meeting", "decline meeting", "tentative", "propose new time",
 ]
-operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall", "get-html", "edit-html", "send-draft", "get-signature", "update-signature"]
+operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "batch-forward", "download-attachment", "contact-lookup", "find-thread", "find-related", "get-email", "recall", "get-html", "edit-html", "send-draft", "get-signature", "update-signature", "list-calendar", "respond-meeting"]
 ---
 
 # Outlook Skill
@@ -109,6 +111,17 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 - Returns: Display name, email, alias, company, department, job title, office, phone, mobile, location
 - **Why:** Outlook search by email address unreliable; use display name instead
 - **Name lookup:** Resolves display names against Exchange Global Address List
+
+### Sending Strategy (AI auto-selects — never ask user)
+
+> **⚠️ CRITICAL:** `reply` cannot remove recipients — `--to`/`--cc` only APPEND. If the desired recipient list is SMALLER than the original thread, you MUST use `forward` (keeps thread context) or `compose` (no thread context). Never ask the user which command to use — decide based on recipients.
+
+| Need | Command |
+| ---- | ------- |
+| Same/more recipients | `reply` |
+| Fewer recipients + thread context needed | `forward` |
+| Fewer recipients + no thread context needed | `compose` with `Re:` subject |
+| Sender only | `reply --only` |
 
 ### Reply
 ```bash
@@ -276,6 +289,31 @@ py -3 scripts/outlook_skill.py update-signature "SignatureName" --body "<p>full 
 ```bash
 powershell -Command "Get-Process outlook -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2; Start-Process outlook"
 ```
+
+### List Calendar
+```bash
+py -3 scripts/outlook_skill.py list-calendar                             # today
+py -3 scripts/outlook_skill.py list-calendar --days 7                    # next 7 days
+py -3 scripts/outlook_skill.py list-calendar --start "2026-06-23" --end "2026-06-30"
+```
+- Shows appointments grouped by date: time range, subject, location, organizer, response status
+- `--days`: Number of days ahead (default: 1 = today only)
+- `--start`/`--end`: Explicit date range (YYYY-MM-DD)
+- Includes recurring meetings (IncludeRecurrences enabled)
+- Response status: Organized, Accepted, Tentative, Declined, Not Responded
+
+### Respond to Meeting
+```bash
+py -3 scripts/outlook_skill.py respond-meeting "<meeting_entry_id>" --action accept
+py -3 scripts/outlook_skill.py respond-meeting "<meeting_entry_id>" --action tentative
+py -3 scripts/outlook_skill.py respond-meeting "<meeting_entry_id>" --action decline
+py -3 scripts/outlook_skill.py respond-meeting "<meeting_entry_id>" --action propose --start "2026-06-25 14:00" --end "2026-06-25 15:00"
+```
+- Responds to a meeting invite in your inbox
+- `--action`: accept, tentative, decline, or propose
+- `--start`/`--end`: Required for `propose` (format: `YYYY-MM-DD HH:MM`)
+- Sends response immediately (no draft gate — user explicitly chose the action)
+- Prints confirmation: action, subject, organizer, time
 
 ### Sending Inline Images
 ```bash

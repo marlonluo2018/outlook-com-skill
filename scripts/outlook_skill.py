@@ -60,6 +60,10 @@ def cmd_list_recent(args):
             emails, message = list_recent_emails(args.folder, args.days)
         else:
             emails, message = list_recent_emails_multi(days=args.days)
+
+        if args.limit and len(emails) > args.limit:
+            emails = emails[:args.limit]
+
         email_count = len(emails)
 
         if getattr(args, 'json', False):
@@ -72,9 +76,12 @@ def cmd_list_recent(args):
                     'to_recipients': e.get('to_recipients', []),
                     'cc_recipients': e.get('cc_recipients', []),
                     'received_time': e.get('received_time', ''),
+                    'start_time': e.get('start_time', ''),
+                    'end_time': e.get('end_time', ''),
                     'folder': e.get('folder_name', e.get('folder', '')),
                     'has_attachments': e.get('has_attachments', False),
                     'meeting_status': e.get('meeting_status', ''),
+                    'message_class': e.get('message_class', ''),
                     'attachments_count': e.get('attachments_count', 0),
                     'body_preview': e.get('body_preview', ''),
                 }
@@ -319,6 +326,26 @@ def _print_thread_summary(emails):
     print()
 
 
+def _format_recipients_brief(email_data):
+    """Format To/CC as compact string: '→ Name1, Name2 +N'."""
+    to_list = email_data.get('to_recipients', [])
+    cc_list = email_data.get('cc_recipients', [])
+    names = []
+    for r in to_list:
+        name = r.get('name', '') or r.get('address', '')
+        if name:
+            names.append(name.split('@')[0].split(',')[0].strip()[:15])
+    total = len(to_list) + len(cc_list)
+    if not names:
+        return ""
+    shown = names[:2]
+    extra = total - len(shown)
+    result = "→ " + ", ".join(shown)
+    if extra > 0:
+        result += f" +{extra}"
+    return result
+
+
 def _display_email_list_brief(emails, show_folder=True):
     """Compact single-line display with email ID on second line."""
     for idx, email_data in enumerate(emails, 1):
@@ -337,8 +364,9 @@ def _display_email_list_brief(emails, show_folder=True):
             stars = "★" * int(confidence * 5) + "☆" * (5 - int(confidence * 5))
             stars_str = f" {stars}"
 
+        recipients_str = _format_recipients_brief(email_data)
         print(f"# {idx}{folder_tag} {received} | {sender:<20} | {subject}{stars_str}")
-        print(f"  ID: {email_id}")
+        print(f"  {recipients_str}  ID: {email_id}")
 
 
 def cmd_search(args):
@@ -365,6 +393,11 @@ def cmd_search(args):
             match_all=args.match_all,
             search_type=args.type,
         )
+
+        if args.limit and len(emails) > args.limit:
+            emails = emails[:args.limit]
+            note += f" (showing first {args.limit})"
+
         print(f"\n✅ {note}\n")
 
         if emails:
@@ -392,26 +425,155 @@ def cmd_get_email(args):
             if getattr(args, 'fields', None):
                 fields = set(f.strip().lower() for f in args.fields.split(','))
 
+            # Detect item type from MessageClass
+            message_class = getattr(email_item, 'MessageClass', 'IPM.Note') or 'IPM.Note'
+            meeting_status = getattr(email_item, 'MeetingStatus', 0)
+            is_meeting_item = message_class.startswith('IPM.Schedule.Meeting') or meeting_status > 0
+
             if not fields:
                 print("\nFull email details:")
                 print(f"ID: {email_id}")
+                # Show item type indicator
+                if message_class.startswith('IPM.Schedule.Meeting.Request'):
+                    print("Type: New Invite")
+                elif message_class.startswith('IPM.Schedule.Meeting.Canceled'):
+                    print("Type: Canceled")
+                elif message_class.startswith('IPM.Schedule.Meeting.Resp.Pos'):
+                    print("Type: Accepted")
+                elif message_class.startswith('IPM.Schedule.Meeting.Resp.Neg'):
+                    print("Type: Declined")
+                elif message_class.startswith('IPM.Schedule.Meeting.Resp.Tent'):
+                    print("Type: Tentative")
+                elif message_class.startswith('IPM.Schedule.Meeting'):
+                    print("Type: Meeting Update")
+                elif meeting_status > 0:
+                    print("Type: Meeting")
             if not fields or 'subject' in fields:
                 print(f"Subject: {email_item.Subject}")
             if not fields or 'from' in fields:
-                print(f"From: {email_item.SenderName} <{email_item.SenderEmailAddress}>")
+                try:
+                    sender_name = email_item.SenderName or ''
+                    sender_email = email_item.SenderEmailAddress or ''
+                except Exception:
+                    sender_name = getattr(email_item, 'Organizer', '') or ''
+                    sender_email = ''
+                # Resolve Exchange DN to SMTP address
+                if sender_email and (sender_email.startswith('/') or getattr(email_item, 'SenderEmailType', '') == 'EX'):
+                    try:
+                        smtp = email_item.Sender.GetExchangeUser().PrimarySmtpAddress
+                        if smtp:
+                            sender_email = smtp
+                    except Exception:
+                        sender_email = ''
+                if sender_email and sender_email != sender_name:
+                    print(f"From: {sender_name} <{sender_email}>")
+                else:
+                    print(f"From: {sender_name}")
             if not fields or 'to' in fields:
-                if email_item.To:
-                    print(f"To: {email_item.To}")
+                try:
+                    to_val = email_item.To
+                    if to_val:
+                        print(f"To: {to_val}")
+                except Exception:
+                    print("To: (unavailable — calendar item)")
             if not fields or 'cc' in fields:
-                if email_item.CC:
-                    print(f"CC: {email_item.CC}")
+                try:
+                    cc_val = email_item.CC
+                    if cc_val:
+                        print(f"CC: {cc_val}")
+                except Exception:
+                    pass
             if not fields or 'date' in fields:
                 rt = getattr(email_item, 'ReceivedTime', None)
-                print(f"Date: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
+                print(f"Received: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
+            # Meeting-specific fields
+            if is_meeting_item and (not fields or 'meeting' in fields):
+                _MAPI_START = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820D0040'
+                _MAPI_END = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820E0040'
+                # Try GetAssociatedAppointment for full meeting details
+                # If the item IS already an AppointmentItem (from calendar folder), use it directly
+                appt = None
+                if message_class.startswith('IPM.Appointment'):
+                    appt = email_item
+                else:
+                    try:
+                        appt = email_item.GetAssociatedAppointment(False)
+                    except Exception:
+                        pass
+                if appt:
+                    start_val = getattr(appt, 'Start', None)
+                    end_val = getattr(appt, 'End', None)
+                    if start_val:
+                        s = start_val.replace(tzinfo=None)
+                        e = end_val.replace(tzinfo=None) if end_val else None
+                        time_line = str(s)
+                        if e:
+                            time_line += f" ~ {e}"
+                        print(f"When: {time_line}")
+                    loc = getattr(appt, 'Location', None)
+                    if loc:
+                        print(f"Location: {loc}")
+                    organizer = getattr(appt, 'Organizer', None)
+                    if organizer:
+                        print(f"Organizer: {organizer}")
+                    # Resolve attendees with email addresses via Recipients collection
+                    try:
+                        required = []
+                        optional = []
+                        for i in range(1, appt.Recipients.Count + 1):
+                            recip = appt.Recipients.Item(i)
+                            name = recip.Name or ''
+                            email = _get_smtp_address(recip)
+                            if email and email != name:
+                                entry = f"{name} <{email}>"
+                            else:
+                                entry = name
+                            if recip.Type == 1:  # olRequired
+                                required.append(entry)
+                            elif recip.Type == 2:  # olOptional
+                                optional.append(entry)
+                        if required:
+                            print(f"Required: {'; '.join(required)}")
+                        if optional:
+                            print(f"Optional: {'; '.join(optional)}")
+                    except Exception:
+                        attendees = getattr(appt, 'RequiredAttendees', None)
+                        if attendees:
+                            print(f"Attendees: {attendees}")
+                    resp_map = {0: "None", 1: "Organized", 2: "Tentative", 3: "Accepted", 4: "Declined", 5: "Not Responded"}
+                    resp = getattr(appt, 'ResponseStatus', None)
+                    if resp is not None and resp in resp_map:
+                        print(f"Response: {resp_map[resp]}")
+                else:
+                    # Fallback to MAPI properties on the inbox item
+                    try:
+                        pa = email_item.PropertyAccessor
+                        start_val = pa.GetProperty(_MAPI_START)
+                        end_val = pa.GetProperty(_MAPI_END)
+                        if start_val:
+                            s = start_val.replace(tzinfo=None)
+                            e = end_val.replace(tzinfo=None) if end_val else None
+                            time_line = str(s)
+                            if e:
+                                time_line += f" ~ {e}"
+                            print(f"When: {time_line}")
+                    except Exception:
+                        pass
             if not fields or 'body' in fields:
-                print(f"\nBody:\n{email_item.Body}")
+                body = getattr(email_item, 'Body', '') or ''
+                if body.strip():
+                    print(f"\nBody:\n{body}")
+                elif is_meeting_item:
+                    print("\nBody: (empty — meeting details are stored in the calendar item, check Calendar for full info)")
+                else:
+                    print(f"\nBody:\n{body}")
 
-            if (not fields or 'body' in fields) and email_item.Attachments.Count > 0:
+            attachments_count = 0
+            try:
+                attachments_count = email_item.Attachments.Count
+            except Exception:
+                pass
+            if (not fields or 'body' in fields) and attachments_count > 0:
                 regular = []
                 embedded = []
                 for i in range(1, email_item.Attachments.Count + 1):
@@ -541,7 +703,7 @@ def _add_inline_images(mail_item, inline_str):
     """Embed images into the HTML body using CID.
 
     Format: "filepath:cid_name" (comma separated for multiple).
-    Windows paths (C:\...) are handled — only the last colon past position 1
+    Windows paths (C:\\...) are handled -- only the last colon past position 1
     is treated as the filepath:cid separator.
 
     If the body already contains cid: references for the images, only sets the
@@ -585,6 +747,56 @@ def _add_inline_images(mail_item, inline_str):
         mail_item.HTMLBody = img_html + mail_item.HTMLBody
     elif cids:
         mail_item.HTMLBody = mail_item.HTMLBody
+
+
+def _preserve_inline_images(dest_item, source_item):
+    """Copy CID-referenced inline images from source to dest to preserve them in replies.
+
+    After HTMLBody reassignment, Outlook drops inline attachments whose CID
+    references it can no longer correlate. This re-adds them explicitly.
+    """
+    import tempfile
+    PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+
+    # Collect CIDs already on the dest item to avoid duplicates
+    existing_cids = set()
+    for i in range(1, dest_item.Attachments.Count + 1):
+        try:
+            cid = dest_item.Attachments.Item(i).PropertyAccessor.GetProperty(PR_ATTACH_CONTENT_ID)
+            if cid:
+                existing_cids.add(cid)
+        except Exception:
+            pass
+
+    added = False
+    for i in range(1, source_item.Attachments.Count + 1):
+        attach = source_item.Attachments.Item(i)
+        try:
+            cid = attach.PropertyAccessor.GetProperty(PR_ATTACH_CONTENT_ID)
+        except Exception:
+            cid = None
+        if not cid:
+            continue
+        # Only copy if the CID is referenced in the HTML body and not already present
+        if f"cid:{cid}" not in dest_item.HTMLBody:
+            continue
+        if cid in existing_cids:
+            continue
+        temp_path = os.path.join(tempfile.gettempdir(), attach.FileName or f"inline_{i}.png")
+        try:
+            attach.SaveAsFile(temp_path)
+            new_attach = dest_item.Attachments.Add(temp_path)
+            new_attach.PropertyAccessor.SetProperty(PR_ATTACH_CONTENT_ID, cid)
+            added = True
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    if added:
+        # Force Outlook to re-resolve CID references
+        dest_item.HTMLBody = dest_item.HTMLBody
 
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico', '.webp'}
@@ -653,7 +865,7 @@ def _format_forward_message_html(message_text: str) -> str:
         return ""
     if re.search(r'<[a-zA-Z][^>]*>', message_text):
         return _wrap_body_font(message_text)
-    inner = '<p>' + message_text.replace('\n\n', '</p><p>').replace('\n', '<br>') + '</p>'
+    inner = message_text.replace('\n\n', '<br><br>').replace('\n', '<br>')
     return _wrap_body_font(inner)
 
 
@@ -782,6 +994,8 @@ def _print_sent_entry_id(session, subject):
             bare_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', subject or '', flags=re.IGNORECASE)
             bare_item_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', item.Subject or '', flags=re.IGNORECASE)
             if sent_utc >= threshold and (not subject or bare_subject in bare_item_subject):
+                local_time = sent_on if sent_on.tzinfo else sent_on.replace(tzinfo=None)
+                print(f"SentOn: {local_time.strftime('%a %b %d, %Y %H:%M')}")
                 print(f"EntryID: {item.EntryID}")
                 return
         except Exception:
@@ -855,6 +1069,7 @@ def cmd_reply(args):
                 reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
 
             reply.HTMLBody = _ensure_utf8_charset(reply.HTMLBody)
+            _preserve_inline_images(reply, email_item)
             reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
 
             if reply.Recipients.Count == 0:
@@ -1275,6 +1490,14 @@ def cmd_lookup_contact(args):
             if contact.get('city') or contact.get('state'):
                 location_parts = [p for p in [contact.get('city'), contact.get('state')] if p]
                 print(f"Location: {', '.join(location_parts)}")
+            if contact.get('manager'):
+                mgr = contact['manager']
+                mgr_parts = [mgr.get('display_name', '')]
+                if mgr.get('email'):
+                    mgr_parts.append(f"<{mgr['email']}>")
+                if mgr.get('job_title'):
+                    mgr_parts.append(f"— {mgr['job_title']}")
+                print(f"Manager: {' '.join(mgr_parts)}")
 
         return 0
     except Exception as e:
@@ -1546,6 +1769,7 @@ def cmd_edit_html(args):
                 draft.Save()
                 print(f"✅ New draft created in Drafts folder")
 
+            print(f"   EntryID: {draft.EntryID}")
             print(f"   Subject: {draft.Subject}")
             print(f"   To: {draft.To}")
             if draft.CC:
@@ -2037,6 +2261,155 @@ def cmd_update_signature(args):
         return 1
 
 
+def cmd_list_calendar(args):
+    """List calendar appointments for a date range."""
+    from datetime import datetime, timedelta
+    try:
+        with OutlookSessionManager() as session:
+            ns = session.outlook_namespace
+            calendar_folder = ns.GetDefaultFolder(9)  # olFolderCalendar
+            items = calendar_folder.Items
+            items.Sort("[Start]")
+            items.IncludeRecurrences = True
+
+            # Determine date range
+            if getattr(args, 'start', None):
+                start_date = datetime.strptime(args.start, '%Y-%m-%d')
+            else:
+                start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+            if getattr(args, 'end', None):
+                end_date = datetime.strptime(args.end, '%Y-%m-%d') + timedelta(days=1)
+            else:
+                days = getattr(args, 'days', 1) or 1
+                end_date = start_date + timedelta(days=days)
+
+            start_str = start_date.strftime('%m/%d/%Y %H:%M %p')
+            end_str = end_date.strftime('%m/%d/%Y %H:%M %p')
+            restriction = f"[Start] >= '{start_str}' AND [Start] < '{end_str}'"
+            filtered = items.Restrict(restriction)
+
+            resp_map = {0: "None", 1: "Organized", 2: "Tentative", 3: "Accepted", 4: "Declined", 5: "Not Responded"}
+            current_day = None
+            count = 0
+
+            item = filtered.GetFirst()
+            while item:
+                try:
+                    start_val = item.Start.replace(tzinfo=None)
+                    end_val = item.End.replace(tzinfo=None)
+                    subject = item.Subject or "(No subject)"
+                    location = getattr(item, 'Location', '') or ''
+                    organizer = getattr(item, 'Organizer', '') or ''
+                    resp = getattr(item, 'ResponseStatus', 0)
+                    resp_label = resp_map.get(resp, "")
+
+                    day_key = start_val.strftime('%Y-%m-%d (%a)')
+                    if day_key != current_day:
+                        if current_day is not None:
+                            print()
+                        print(day_key)
+                        current_day = day_key
+
+                    entry_id = getattr(item, 'EntryID', '') or ''
+                    time_range = f"{start_val.strftime('%H:%M')}-{end_val.strftime('%H:%M')}"
+                    parts = [time_range, subject]
+                    if location:
+                        parts.append(location)
+                    if organizer:
+                        parts.append(f"Organizer: {organizer}")
+                    if resp_label:
+                        parts.append(resp_label)
+                    print(f"  {' | '.join(parts)}")
+                    if entry_id:
+                        print(f"    ID: {entry_id}")
+                    count += 1
+                except Exception:
+                    pass
+                item = filtered.GetNext()
+
+            if count == 0:
+                print("No appointments found in this date range.")
+            else:
+                print(f"\n({count} items)")
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
+def cmd_respond_meeting(args):
+    """Respond to a meeting invite: accept, tentative, decline, or propose new time."""
+    from datetime import datetime
+    try:
+        email_id = args.email_id
+        action = args.action
+
+        with OutlookSessionManager() as session:
+            email_item = _get_email_item(session, email_id)
+
+            # Verify it's a meeting item
+            message_class = getattr(email_item, 'MessageClass', '') or ''
+            if not message_class.startswith('IPM.Schedule.Meeting'):
+                print("Error: This item is not a meeting invite.", file=sys.stderr)
+                return 1
+
+            # Map action to Outlook constants
+            ACTION_MAP = {'accept': 3, 'tentative': 2, 'decline': 4, 'propose': 2}
+            response_const = ACTION_MAP[action]
+
+            # Show what we're about to do
+            subject = getattr(email_item, 'Subject', '(No subject)')
+            appt = None
+            try:
+                appt = email_item.GetAssociatedAppointment(False)
+            except Exception:
+                pass
+
+            organizer = ''
+            when_str = ''
+            if appt:
+                organizer = getattr(appt, 'Organizer', '') or ''
+                start_val = getattr(appt, 'Start', None)
+                end_val = getattr(appt, 'End', None)
+                if start_val:
+                    s = start_val.replace(tzinfo=None)
+                    when_str = str(s)
+                    if end_val:
+                        e = end_val.replace(tzinfo=None)
+                        when_str += f" ~ {e}"
+
+            action_label = {'accept': 'Accept', 'tentative': 'Tentative', 'decline': 'Decline', 'propose': 'Propose New Time'}[action]
+            print(f"Action: {action_label}")
+            print(f"Meeting: {subject}")
+            if organizer:
+                print(f"Organizer: {organizer}")
+            if when_str:
+                print(f"When: {when_str}")
+
+            if action == 'propose':
+                if not args.start or not args.end:
+                    print("Error: --start and --end are required for propose action.", file=sys.stderr)
+                    return 1
+                new_start = datetime.strptime(args.start, '%Y-%m-%d %H:%M')
+                new_end = datetime.strptime(args.end, '%Y-%m-%d %H:%M')
+                print(f"Proposed: {new_start} ~ {new_end}")
+
+            # Execute the response via AppointmentItem (MeetingItem doesn't expose Respond)
+            # GetAssociatedAppointment(True) adds to calendar, returns AppointmentItem
+            # AppointmentItem.Respond(olResponse, fNoUI) returns a MeetingItem to .Send()
+            appt_to_respond = email_item.GetAssociatedAppointment(True)
+            resp = appt_to_respond.Respond(response_const, True)
+            resp.Send()
+
+            print(f"\nDone. Response sent: {action_label}")
+            print(f"ID: {email_id}")
+        return 0
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description='Outlook Skill for BrainClaw - Email Management CLI')
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
@@ -2050,6 +2423,7 @@ def main():
     parser_list_recent = subparsers.add_parser('find-recent', help='Find recent emails with IDs')
     parser_list_recent.add_argument('--days', type=int, default=7, help='Days back to search (1-30)')
     parser_list_recent.add_argument('--folder', type=str, default=None, help='Folder name (default: Inbox)')
+    parser_list_recent.add_argument('--limit', type=int, default=None, help='Max number of results to return (default: all)')
     parser_list_recent.add_argument('--json', action='store_true', help='Output JSON for piping to email_sync.py')
     parser_list_recent.set_defaults(func=cmd_list_recent)
     
@@ -2069,6 +2443,7 @@ def main():
     )
     parser_search.add_argument('--folder', type=str, default=None, help='Folder name (default: Inbox)')
     parser_search.add_argument('--folders', type=str, default=None, help='Comma-separated folder names for cross-folder search')
+    parser_search.add_argument('--limit', type=int, default=None, help='Max number of results to return (default: all)')
     parser_search.add_argument('--match-all', action='store_true', default=True, help='Match all terms (AND logic)')
     parser_search.set_defaults(func=cmd_search)
     
@@ -2184,7 +2559,7 @@ def main():
     parser_related.add_argument('--days', type=int, default=90, help='Days back for sender/keyword strategies')
     parser_related.add_argument('--strategies', type=str, default=None, help='Strategies: thread,sender,recipient,keyword (default: all)')
     parser_related.add_argument('--exclude-thread', action='store_true', help='Skip thread strategy (useful after find-thread)')
-    parser_related.add_argument('--max', type=int, dest='max_results', default=None, help='Maximum results to return (default: from config)')
+    parser_related.add_argument('--limit', type=int, dest='max_results', default=None, help='Maximum results to return (default: from config)')
     parser_related.add_argument('--brief', action='store_true', help='Compact single-line output')
     parser_related.set_defaults(func=cmd_find_related)
 
@@ -2245,6 +2620,21 @@ def main():
     parser_update_sig.add_argument('--after', help='Insert new content after this text (use with --insert)')
     parser_update_sig.add_argument('--insert', help='Text to insert (use \\n for new lines, use with --after)')
     parser_update_sig.set_defaults(func=cmd_update_signature)
+
+    # List calendar command
+    parser_calendar = subparsers.add_parser('list-calendar', help='View calendar appointments')
+    parser_calendar.add_argument('--days', type=int, default=1, help='Days ahead to show (default: today only)')
+    parser_calendar.add_argument('--start', help='Start date (YYYY-MM-DD)')
+    parser_calendar.add_argument('--end', help='End date (YYYY-MM-DD)')
+    parser_calendar.set_defaults(func=cmd_list_calendar)
+
+    # Respond to meeting command
+    parser_respond = subparsers.add_parser('respond-meeting', help='Accept/decline/tentative a meeting invite')
+    parser_respond.add_argument('email_id', help='Meeting item Entry ID')
+    parser_respond.add_argument('--action', required=True, choices=['accept', 'tentative', 'decline', 'propose'])
+    parser_respond.add_argument('--start', help='Proposed new start time (YYYY-MM-DD HH:MM, for --action propose)')
+    parser_respond.add_argument('--end', help='Proposed new end time (YYYY-MM-DD HH:MM, for --action propose)')
+    parser_respond.set_defaults(func=cmd_respond_meeting)
 
     # Parse arguments
     args = parser.parse_args()

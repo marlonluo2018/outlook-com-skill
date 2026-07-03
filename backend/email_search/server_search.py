@@ -75,17 +75,22 @@ def _search_single_folder(
     folder_path = getattr(folder, 'FolderPath', str(folder))
     need_fallback = False
 
-    try:
-        items = folder.Items
-        restricted_items = items.Restrict(search_criteria)
-        results = list(restricted_items)
-        logger.info(f"Restrict found {len(results)} results in '{folder.Name}'")
-        if results:
-            return results[:max_results]
+    # ConversationID Restrict always fails on Exchange (0x3013001F not
+    # queryable via DAV schema) — skip straight to manual scan.
+    if search_type == "conversation":
         need_fallback = True
-    except Exception as e:
-        logger.warning(f"Restrict failed for '{folder.Name}': {e}")
-        need_fallback = True
+    else:
+        try:
+            items = folder.Items
+            restricted_items = items.Restrict(search_criteria)
+            results = list(restricted_items)
+            logger.info(f"Restrict found {len(results)} results in '{folder.Name}'")
+            if results:
+                return results[:max_results]
+            need_fallback = True
+        except Exception as e:
+            logger.warning(f"Restrict failed for '{folder.Name}': {e}")
+            need_fallback = True
 
     if not need_fallback:
         return []
