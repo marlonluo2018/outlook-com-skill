@@ -131,21 +131,27 @@ def get_contact_by_email(email_address: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
+def get_contact_by_name(display_name: str, include_all_matches: bool = False) -> List[Dict[str, Any]]:
     """
-    Look up contacts by display name via Exchange GAL.
+    Look up contacts by display name.
 
-    Always searches the GAL to return ALL matching contacts,
-    not just the first resolved match.
+    By default this uses Outlook's single-recipient resolver. Full GAL scans are
+    slower and more likely to block Outlook COM, so callers must opt in with
+    include_all_matches=True when they really need multiple matches.
 
     Args:
         display_name: The display name to search for (e.g., "HONG YANG")
+        include_all_matches: Search nearby GAL entries instead of returning the
+            first resolved contact.
 
     Returns:
         List of matching contacts. Empty list if none found.
     """
     try:
         with OutlookSessionManager() as session:
+            if not include_all_matches:
+                return _resolve_single_contact(session, display_name)
+
             namespace = session.outlook_namespace
             gal = None
             for al in namespace.AddressLists:
@@ -169,7 +175,8 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
                 except Exception:
                     return
                 while entry:
-                    if search_upper in entry.Name.upper():
+                    entry_name = getattr(entry, 'Name', '') or ''
+                    if search_upper in entry_name.upper():
                         try:
                             exchange_user = entry.GetExchangeUser()
                             if exchange_user:
@@ -207,7 +214,6 @@ def get_contact_by_name(display_name: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Error looking up contact by name: {e}")
         return []
-
 
 def _resolve_single_contact(session, display_name: str) -> List[Dict[str, Any]]:
     """Fallback: resolve a single contact via CreateRecipient."""

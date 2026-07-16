@@ -49,17 +49,26 @@ py -3 scripts/outlook_skill.py find-recent --days 7
 
 ### Find Emails
 ```bash
-py -3 scripts/outlook_skill.py find --type subject --query "Name" --days 14
+py -3 scripts/outlook_skill.py find --from "Beng" --days 14
+py -3 scripts/outlook_skill.py find --subject "voucher" --days 7 --limit 5
+py -3 scripts/outlook_skill.py find --to "carmina" --days 30
+py -3 scripts/outlook_skill.py find --body "approved" --days 7
+py -3 scripts/outlook_skill.py find --from "beng" --subject "voucher" --days 14
 ```
-- Default folder depends on `--type`:
-  - `subject`, `body` → **Inbox + Sent Items** (searches both folders by default)
-  - `sender` → **Inbox** only
-  - `recipient` → **Sent Items** only
-- `--type`: subject, sender, recipient, body
-- `recipient` search matches recipients in sent mail using **To + CC** fields and resolved Outlook recipient names/addresses
-- `--query`: search text (required)
-- `--days`: 1-365 for direct `find` searches (default: 14)
-- `--folders`: use only when explicitly searching across folders (searches Inbox + Sent Items)
+- `--from`: search by sender name/email
+- `--subject`: search by subject
+- `--to`: search by recipient name/email
+- `--body`: search by body content
+- `--days`: 1-365 (default: 14)
+- `--limit`: max results (default: all)
+- `--folder`: single folder to search
+- `--folders`: comma-separated folder names for cross-folder search
+- Multiple fields can be combined (AND logic): `--from "X" --subject "Y"` returns emails matching both
+- Default folder depends on field:
+  - `--subject`, `--body` → **Inbox + Sent Items** (both)
+  - `--from` → **Inbox** only
+  - `--to` → **Sent Items** only
+- `--to` matches recipients in sent mail using **To + CC** fields and resolved Outlook names/addresses
 - **AI guidance:** start with a small recent window first (usually 7-14 days)
 - If the first search does not find the email, widen the date range gradually and make the query more specific before broadening further
 - Use `find-thread` or `find-related` when older or broader history is needed
@@ -124,26 +133,34 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 | Sender only | `reply --only` |
 
 ### Reply
-```bash
-echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin
-echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --cc "extra@ibm.com"
-echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --attach "C:\path\file.pdf"
-echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --importance high
-echo "<body>" | py -3 scripts/outlook_skill.py reply "<email_id>" --body-stdin --only
+
+The **default and preferred** way is to pass the message directly via the `--body` argument. This avoids console/pipe encoding and escaping issues entirely for standard emails.
+
+```powershell
+py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Thank you for the update.</p>"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Approved, please proceed.</p>" --cc "extra@ibm.com"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Please see attachment.</p>" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Action required.</p>" --importance high
+py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Done.</p>" --only
 ```
+
 - **Default: reply-all** — keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
-- **`--only`: reply to From (sender) only** — use only when user explicitly asks to narrow
-- `--attach`: File path(s) to attach (comma separated for multiple)
-- `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox
+- **`--only`: reply to From (sender) only** — use only when user explicitly asks to narrow.
+- `--attach`: File path(s) to attach (comma separated for multiple).
+- `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox.
 - **⚠️ ALWAYS show draft to user first — NEVER send before user approval**
 
 ### Compose Email
-```bash
-echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin
-echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin --attach "C:\path\file.pdf"
-echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin --importance high
-echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-stdin --inline-image "C:\path\img.png:pic1"
+
+The **default and preferred** way is to pass the message directly via the `--body` argument.
+
+```powershell
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>Message text.</p>"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>See attached.</p>" --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>Urgent request.</p>" --importance high
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>Embed image:<br><img src='cid:pic1'></p>" --inline-image "C:\path\img.png:pic1"
 ```
+
 - `--attach`: File path(s) to attach (comma separated for multiple)
 - `--inline-image`: Embed image inline via CID (format: `filepath:cid_name`, comma separated)
 - `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox
@@ -153,24 +170,28 @@ echo "<body>" | py -3 scripts/outlook_skill.py compose --to "email" --subject "t
 - Sends immediately when called
 
 ### Forward (single)
-```bash
+
+```powershell
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com"
-echo "<body>" | py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com,user2@ibm.com" --cc "manager@ibm.com" --body-stdin
+py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com" --cc "manager@ibm.com" --body "<p>FYI, forwarding this thread.</p>"
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com" --attach "C:\path\file.pdf"
 ```
+
 - Forwards an email to specified recipients
 - `--to` (required): Comma-separated list of To recipients
 - `--cc` (optional): Comma-separated list of CC recipients
-- `--body-stdin` or `--body` (optional): Custom HTML message to prepend
+- `--body` (optional): Custom HTML message to prepend
 - `--attach` (optional): File path(s) to attach (comma separated for multiple)
 - Subject auto-prefixed with `FW:`
 - Preserves original email formatting
 - **⚠️ ALWAYS show draft to user first — NEVER send before user approval**
 
 ### Batch Forward
-```bash
+
+```powershell
 py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --message "<p>HTML body</p>"
 ```
+
 - CSV: single column named "email" (supports BOM encoding)
 - `--message`: Optional HTML message to prepend (same format as reply)
 - Uses BCC for privacy
@@ -179,13 +200,15 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 - **Batch size:** Configured in [`backend/config.py`](backend/config.py) (default: 500)
 
 ### Redirect (Clear Recipients + New TO/CC)
-```bash
-echo "<body>" | py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com,c@d.com" --body-stdin
-echo "<body>" | py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com" --cc "b@b.com" --body-stdin
+
+```powershell
+py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com,c@d.com" --body "<p>Redirecting thread.</p>"
+py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com" --cc "b@b.com" --body "<p>Please handle.</p>"
 ```
+
 - Clears all existing TO and CC recipients, then adds new ones
 - Preserves original email body as quoted content (like forward)
-- `--body-stdin` or positional `body`: HTML message prepended above original content
+- `--body` (optional): HTML message prepended above original content
 - `--to` (required): New TO recipients (comma separated)
 - `--cc`: New CC recipients (comma separated)
 - `--attach`: File path(s) to attach (comma separated)
@@ -217,10 +240,13 @@ py -3 scripts/outlook_skill.py download-attachment "<email_id>" --filename "repo
 
 ### Get Full Email Details
 ```bash
-py -3 scripts/outlook_skill.py get-email "<email_id>"
+py -3 scripts/outlook_skill.py get-email "<email_id_1>" "<email_id_2>" ...
+py -3 scripts/outlook_skill.py get-email "<email_id>" --truncate 1000
 ```
-- Returns complete email: full body, all attachments, metadata
-- Use after search/thread/related to read the actual content
+- Returns complete email details: full body, all attachments, metadata.
+- **Batch retrieval:** Supports passing multiple email IDs separated by spaces to print them sequentially in one run.
+- `--truncate N`: Truncate the printed body text to `N` characters to save terminal output and optimize context window/tokens.
+- Use after search/thread/related to read the actual content.
 - **Embedded images:** Auto-extracted to `%TEMP%\outlook_inline\<id>\`. Paths printed in output — use Read tool to view.
 
 ### Get Email HTML (Template Editing — Step 1: Read)
@@ -369,28 +395,46 @@ class BatchConfig:
 
 ## ⚠️ Special Characters in Email Body
 
-**CRITICAL:** Always use `--body-stdin` with a **heredoc** to pass email body content. A heredoc with quoted delimiter (`<<'EOF'`) prevents ALL shell variable expansion and handles any character safely.
+**CRITICAL:** Always use `--body-stdin` with a **here-string** (PowerShell) or **heredoc** (Git Bash) to pass email body content. This prevents all shell variable expansion/interpolation and handles any special character safely.
 
-**Mandatory workflow:**
-1. Use heredoc with quoted `'EOF'` to pipe body — this prevents `$0`, `$VAR`, backticks, etc. from being interpreted by bash
-2. Python reads from stdin — no shell expansion, no temp file
+> ℹ️ **Note:** The Outlook COM skill is strictly **Windows-only** (as it relies on Microsoft Outlook COM APIs). The workflows below are categorized by the Windows shell you are running.
+
+### 1. Windows PowerShell Workflow (Native Shell — Preferred)
+
+Use a single-quoted here-string (`@' ... '@`). Single quotes prevent PowerShell from performing any variable expansion (preserving `$` signs, quotes, and backticks).
+
+```powershell
+# ✅ CORRECT (PowerShell): Single-quoted here-string preserves all special chars
+$body = @'
+<p>Cost: $80,000 — preserves $0, $VAR, and all special chars like apostrophes (I'm, don't)</p>
+'@
+$body | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
+```
+
+### 2. Git Bash on Windows Workflow (Bash Shell)
+
+If you are using Git Bash on Windows, use a heredoc with a quoted delimiter (`<<'EOF'`). Quoting the delimiter prevents Bash from executing variable/command substitutions.
 
 ```bash
-# ✅ CORRECT: heredoc with quoted delimiter, $ signs preserved
+# ✅ CORRECT (Git Bash): Heredoc with quoted delimiter preserves all special chars
 cat <<'EOF' | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
-<p>Cost: $80,000 — this preserves $0, $VAR, and all special chars</p>
+<p>Cost: $80,000 — preserves $0, $VAR, and all special chars like apostrophes (I'm, don't)</p>
 EOF
+```
 
-# ❌ WRONG: double-quoted echo — bash expands $0 to shell name, $8 to empty
+### ❌ Incorrect Patterns (Avoid)
+
+```powershell
+# ❌ WRONG: double-quoted echo — shell expands $0 and $VAR, causing blank outputs or errors
 echo "Cost: $80,000" | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
 
-# ❌ WRONG: inline body arg — same expansion problem
+# ❌ WRONG: inline body arg — same expansion problem, plus command length / escaping issues
 py -3 scripts/outlook_skill.py reply "<id>" "Cost: $80,000"
 ```
 
-**Why not single quotes?** `echo '...'` works for `$` but breaks if the body contains apostrophes (`I'm`, `don't`). Heredoc handles both.
+**Why not single quotes?** `echo '...'` works for `$` in Git Bash but breaks if the body contains apostrophes (`I'm`, `don't`). Here-strings / heredocs handle both.
 
-**Fallback (if heredoc unavailable):** Replace `$` with `&#36;` in the body text.
+**Fallback (if stdin piping is unavailable):** Replace `$` with `&#36;` in the body text.
 
 ### Non-ASCII Characters (UTF-8)
 
@@ -419,6 +463,14 @@ py -3 scripts/outlook_skill.py find-thread "<entry_id>"
 # Step 4: For even more context, find related across threads
 py -3 scripts/outlook_skill.py find-related "<entry_id>"
 ```
+
+## Custom Folders
+
+| Folder | Path | Purpose |
+|--------|------|---------|
+| Recognized | `luomn@cn.ibm.com/Inbox/Recognized` | Thanks@IBM recognition emails |
+
+**Note:** `move-email` cannot resolve subfolder names alone (e.g., `"Recognized"` fails). Always use the full mailbox path: `luomn@cn.ibm.com/Inbox/FolderName`.
 
 ## Requirements
 

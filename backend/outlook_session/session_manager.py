@@ -47,7 +47,12 @@ class OutlookSessionManager:
         try:
             pythoncom.CoInitialize()
             self._com_initialized = True
-            self.outlook = win32com.client.Dispatch("Outlook.Application")
+            try:
+                self.outlook = win32com.client.GetActiveObject("Outlook.Application")
+                logger.debug("Attached to active Outlook.Application instance")
+            except Exception as active_error:
+                logger.debug(f"No active Outlook.Application instance available: {active_error}")
+                self.outlook = win32com.client.Dispatch("Outlook.Application")
             self.namespace = self.outlook.GetNamespace("MAPI")
             self._folder_operations = FolderOperations(self)
             self._connected = True

@@ -7,8 +7,19 @@ import sys
 import os
 import re
 import json
+import base64
+import html
 import argparse
+import contextlib
+import subprocess
+import tempfile
+import time
 from typing import Optional
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - this Outlook skill is Windows-only
+    msvcrt = None
 
 # Force UTF-8 for stdin, stdout and stderr on Windows
 if sys.stdin and hasattr(sys.stdin, 'reconfigure') and sys.stdin.encoding != 'utf-8':
@@ -39,6 +50,126 @@ from backend.email_composition import compose_email
 from backend.outlook_session.contact_operations import get_contact_by_email, get_contact_by_name, get_display_name_from_email
 from backend.config import search_config, display_config
 
+
+OUTLOOK_SKILL_CHILD_ENV = "OUTLOOK_SKILL_CHILD"
+OUTLOOK_LOCK_TIMEOUT_SECONDS = int(os.environ.get("OUTLOOK_SKILL_LOCK_TIMEOUT", "30"))
+OUTLOOK_DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("OUTLOOK_SKILL_TIMEOUT", "60"))
+OUTLOOK_COMMAND_TIMEOUTS = {
+    "lookup-contact": 20,
+    "compose": 90,
+    "reply": 90,
+    "forward": 90,
+    "redirect": 90,
+    "send-draft": 90,
+    "batch-forward": 300,
+    "recall": 90,
+    "respond-meeting": 90,
+    "download-attachment": 120,
+}
+
+
+class OutlookCliLockTimeout(TimeoutError):
+    """Raised when another Outlook COM command holds the process-wide lock."""
+
+
+@contextlib.contextmanager
+def _outlook_cli_lock(timeout_seconds: int = OUTLOOK_LOCK_TIMEOUT_SECONDS):
+    """Serialize Outlook COM access across CLI processes.
+
+    Outlook COM is single-user desktop automation and becomes unreliable when
+    multiple Python processes drive it at once. A byte-range lock gives us an
+    OS-released mutex even if a process is killed after a timeout.
+    """
+    if msvcrt is None:
+        yield
+        return
+
+    lock_path = os.path.join(tempfile.gettempdir(), "brainclaw_outlook_com.lock")
+    with open(lock_path, "a+b") as lock_file:
+        lock_file.seek(0)
+        if not lock_file.read(1):
+            lock_file.write(b"0")
+            lock_file.flush()
+
+        deadline = time.monotonic() + max(timeout_seconds, 1)
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise OutlookCliLockTimeout(
+                        f"Timed out waiting {timeout_seconds}s for another Outlook command to finish."
+                    )
+                time.sleep(0.25)
+
+        try:
+            yield
+        finally:
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+
+
+def _should_isolate_outlook_command(args) -> bool:
+    """Return True when the parsed command should run in a timeout child process."""
+    return bool(getattr(args, "command", None)) and os.environ.get(OUTLOOK_SKILL_CHILD_ENV) != "1"
+
+
+def _timeout_for_command(args) -> int:
+    requested = getattr(args, "timeout", None)
+    if requested is not None:
+        return max(int(requested), 1)
+    return OUTLOOK_COMMAND_TIMEOUTS.get(args.command, OUTLOOK_DEFAULT_TIMEOUT_SECONDS)
+
+
+def _run_outlook_command_isolated(args) -> int:
+    """Run the command in a child process so blocking COM calls can be terminated."""
+    timeout_seconds = _timeout_for_command(args)
+    env = os.environ.copy()
+    env[OUTLOOK_SKILL_CHILD_ENV] = "1"
+
+    command = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
+    try:
+        with _outlook_cli_lock():
+            completed = subprocess.run(
+                command,
+                env=env,
+                timeout=timeout_seconds,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+    except OutlookCliLockTimeout as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 124
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+        print(
+            f"Error: Outlook command '{args.command}' timed out after {timeout_seconds}s and was stopped.",
+            file=sys.stderr,
+        )
+        print(
+            "Outlook COM may be busy, waiting on a hidden dialog, or unable to access the current desktop session.",
+            file=sys.stderr,
+        )
+        return 124
+
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    return completed.returncode
 
 def cmd_list_folders(args):
     """List all Outlook folders"""
@@ -372,6 +503,25 @@ def _display_email_list_brief(emails, show_folder=True):
 def cmd_search(args):
     """Search emails and display with IDs - supports multi-folder."""
     try:
+        # Resolve field flags → (search_type, query) pairs
+        field_searches = []
+        if getattr(args, 'from_', None):
+            field_searches.append(('sender', args.from_))
+        if getattr(args, 'subject', None):
+            field_searches.append(('subject', args.subject))
+        if getattr(args, 'to', None):
+            field_searches.append(('recipient', args.to))
+        if getattr(args, 'body', None):
+            field_searches.append(('body', args.body))
+
+        # Legacy --type/--query fallback
+        if not field_searches:
+            if args.type and args.query:
+                field_searches.append((args.type, args.query))
+            else:
+                print("Error: at least one search field required (--from, --subject, --to, or --body)", file=sys.stderr)
+                return 1
+
         effective_days = _normalize_search_days(args.days)
         if args.days != effective_days:
             print(
@@ -385,14 +535,41 @@ def cmd_search(args):
         else:
             folder_names = None
 
-        emails, note = unified_search(
-            search_term=args.query,
-            days=effective_days,
-            folder_name=args.folder,
-            folder_names=folder_names,
-            match_all=args.match_all,
-            search_type=args.type,
-        )
+        # Single-field search (most common case)
+        if len(field_searches) == 1:
+            search_type, query = field_searches[0]
+            emails, note = unified_search(
+                search_term=query,
+                days=effective_days,
+                folder_name=args.folder,
+                folder_names=folder_names,
+                match_all=args.match_all,
+                search_type=search_type,
+            )
+        else:
+            # Multi-field: run each search, intersect by email ID
+            result_sets = []
+            for search_type, query in field_searches:
+                emails_part, _ = unified_search(
+                    search_term=query,
+                    days=effective_days,
+                    folder_name=args.folder,
+                    folder_names=folder_names,
+                    match_all=args.match_all,
+                    search_type=search_type,
+                )
+                result_sets.append({e.get('id') or e.get('entry_id', ''): e for e in emails_part})
+
+            # Intersect: keep only emails present in ALL result sets
+            if result_sets:
+                common_ids = set(result_sets[0].keys())
+                for rs in result_sets[1:]:
+                    common_ids &= set(rs.keys())
+                emails = [result_sets[0][eid] for eid in common_ids if eid]
+            else:
+                emails = []
+            fields_desc = " + ".join(f"{t}='{q}'" for t, q in field_searches)
+            note = f"Found {len(emails)} emails matching {fields_desc}"
 
         if args.limit and len(emails) > args.limit:
             emails = emails[:args.limit]
@@ -401,8 +578,9 @@ def cmd_search(args):
         print(f"\n✅ {note}\n")
 
         if emails:
+            primary_type = field_searches[0][0]
             show_folder = (folder_names is not None and len(folder_names) > 1) or \
-                          (folder_names is None and args.folder is None and args.type == "subject")
+                          (folder_names is None and args.folder is None and primary_type == "subject")
             _display_email_list(emails, show_folder=show_folder)
 
         return 0
@@ -414,142 +592,115 @@ def cmd_search(args):
 def cmd_get_email(args):
     """Get full email details by ID"""
     try:
-        email_id = args.email_id or getattr(args, 'email_id_flag', None)
-        if not email_id:
+        email_ids = getattr(args, 'email_ids', [])
+        if not email_ids and getattr(args, 'email_id_flag', None):
+            email_ids = [args.email_id_flag]
+        if not email_ids and getattr(args, 'email_id', None):
+            if isinstance(args.email_id, list):
+                email_ids = args.email_id
+            else:
+                email_ids = [args.email_id]
+
+        if not email_ids:
             print("Error: email_id is required (positional or --id)", file=sys.stderr)
             return 1
+
+        fields = None
+        if getattr(args, 'fields', None):
+            fields = set(f.strip().lower() for f in args.fields.split(','))
+
+        truncate_len = getattr(args, 'truncate', None)
+
         with OutlookSessionManager() as session:
-            email_item = _get_email_item(session, email_id)
-
-            fields = None
-            if getattr(args, 'fields', None):
-                fields = set(f.strip().lower() for f in args.fields.split(','))
-
-            # Detect item type from MessageClass
-            message_class = getattr(email_item, 'MessageClass', 'IPM.Note') or 'IPM.Note'
-            meeting_status = getattr(email_item, 'MeetingStatus', 0)
-            is_meeting_item = message_class.startswith('IPM.Schedule.Meeting') or meeting_status > 0
-
-            if not fields:
-                print("\nFull email details:")
-                print(f"ID: {email_id}")
-                # Show item type indicator
-                if message_class.startswith('IPM.Schedule.Meeting.Request'):
-                    print("Type: New Invite")
-                elif message_class.startswith('IPM.Schedule.Meeting.Canceled'):
-                    print("Type: Canceled")
-                elif message_class.startswith('IPM.Schedule.Meeting.Resp.Pos'):
-                    print("Type: Accepted")
-                elif message_class.startswith('IPM.Schedule.Meeting.Resp.Neg'):
-                    print("Type: Declined")
-                elif message_class.startswith('IPM.Schedule.Meeting.Resp.Tent'):
-                    print("Type: Tentative")
-                elif message_class.startswith('IPM.Schedule.Meeting'):
-                    print("Type: Meeting Update")
-                elif meeting_status > 0:
-                    print("Type: Meeting")
-            if not fields or 'subject' in fields:
-                print(f"Subject: {email_item.Subject}")
-            if not fields or 'from' in fields:
+            for idx, email_id in enumerate(email_ids):
+                if len(email_ids) > 1:
+                    print("\n" + "="*40)
+                    print(f"Email {idx+1}/{len(email_ids)}")
+                    print("="*40)
+                
                 try:
-                    sender_name = email_item.SenderName or ''
-                    sender_email = email_item.SenderEmailAddress or ''
-                except Exception:
-                    sender_name = getattr(email_item, 'Organizer', '') or ''
-                    sender_email = ''
-                # Resolve Exchange DN to SMTP address
-                if sender_email and (sender_email.startswith('/') or getattr(email_item, 'SenderEmailType', '') == 'EX'):
+                    email_item = _get_email_item(session, email_id)
+                except Exception as e:
+                    print(f"Error fetching email {email_id}: {str(e)}", file=sys.stderr)
+                    continue
+
+                # Detect item type from MessageClass
+                message_class = getattr(email_item, 'MessageClass', 'IPM.Note') or 'IPM.Note'
+                meeting_status = getattr(email_item, 'MeetingStatus', 0)
+                is_meeting_item = message_class.startswith('IPM.Schedule.Meeting') or meeting_status > 0
+
+                if not fields:
+                    print("\nFull email details:")
+                    print(f"ID: {email_id}")
+                    # Show item type indicator
+                    if message_class.startswith('IPM.Schedule.Meeting.Request'):
+                        print("Type: New Invite")
+                    elif message_class.startswith('IPM.Schedule.Meeting.Canceled'):
+                        print("Type: Canceled")
+                    elif message_class.startswith('IPM.Schedule.Meeting.Resp.Pos'):
+                        print("Type: Accepted")
+                    elif message_class.startswith('IPM.Schedule.Meeting.Resp.Neg'):
+                        print("Type: Declined")
+                    elif message_class.startswith('IPM.Schedule.Meeting.Resp.Tent'):
+                        print("Type: Tentative")
+                    elif message_class.startswith('IPM.Schedule.Meeting'):
+                        print("Type: Meeting Update")
+                    elif meeting_status > 0:
+                        print("Type: Meeting")
+                if not fields or 'subject' in fields:
+                    print(f"Subject: {email_item.Subject}")
+                if not fields or 'from' in fields:
                     try:
-                        smtp = email_item.Sender.GetExchangeUser().PrimarySmtpAddress
-                        if smtp:
-                            sender_email = smtp
+                        sender_name = email_item.SenderName or ''
+                        sender_email = email_item.SenderEmailAddress or ''
                     except Exception:
+                        sender_name = getattr(email_item, 'Organizer', '') or ''
                         sender_email = ''
-                if sender_email and sender_email != sender_name:
-                    print(f"From: {sender_name} <{sender_email}>")
-                else:
-                    print(f"From: {sender_name}")
-            if not fields or 'to' in fields:
-                try:
-                    to_val = email_item.To
-                    if to_val:
-                        print(f"To: {to_val}")
-                except Exception:
-                    print("To: (unavailable — calendar item)")
-            if not fields or 'cc' in fields:
-                try:
-                    cc_val = email_item.CC
-                    if cc_val:
-                        print(f"CC: {cc_val}")
-                except Exception:
-                    pass
-            if not fields or 'date' in fields:
-                rt = getattr(email_item, 'ReceivedTime', None)
-                print(f"Received: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
-            # Meeting-specific fields
-            if is_meeting_item and (not fields or 'meeting' in fields):
-                _MAPI_START = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820D0040'
-                _MAPI_END = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820E0040'
-                # Try GetAssociatedAppointment for full meeting details
-                # If the item IS already an AppointmentItem (from calendar folder), use it directly
-                appt = None
-                if message_class.startswith('IPM.Appointment'):
-                    appt = email_item
-                else:
+                    # Resolve Exchange DN to SMTP address
+                    if sender_email and (sender_email.startswith('/') or getattr(email_item, 'SenderEmailType', '') == 'EX'):
+                        try:
+                            smtp = email_item.Sender.GetExchangeUser().PrimarySmtpAddress
+                            if smtp:
+                                sender_email = smtp
+                        except Exception:
+                            sender_email = ''
+                    if sender_email and sender_email != sender_name:
+                        print(f"From: {sender_name} <{sender_email}>")
+                    else:
+                        print(f"From: {sender_name}")
+                if not fields or 'to' in fields:
                     try:
-                        appt = email_item.GetAssociatedAppointment(False)
+                        to_val = email_item.To
+                        if to_val:
+                            print(f"To: {to_val}")
+                    except Exception:
+                        print("To: (unavailable — calendar item)")
+                if not fields or 'cc' in fields:
+                    try:
+                        cc_val = email_item.CC
+                        if cc_val:
+                            print(f"CC: {cc_val}")
                     except Exception:
                         pass
-                if appt:
-                    start_val = getattr(appt, 'Start', None)
-                    end_val = getattr(appt, 'End', None)
-                    if start_val:
-                        s = start_val.replace(tzinfo=None)
-                        e = end_val.replace(tzinfo=None) if end_val else None
-                        time_line = str(s)
-                        if e:
-                            time_line += f" ~ {e}"
-                        print(f"When: {time_line}")
-                    loc = getattr(appt, 'Location', None)
-                    if loc:
-                        print(f"Location: {loc}")
-                    organizer = getattr(appt, 'Organizer', None)
-                    if organizer:
-                        print(f"Organizer: {organizer}")
-                    # Resolve attendees with email addresses via Recipients collection
-                    try:
-                        required = []
-                        optional = []
-                        for i in range(1, appt.Recipients.Count + 1):
-                            recip = appt.Recipients.Item(i)
-                            name = recip.Name or ''
-                            email = _get_smtp_address(recip)
-                            if email and email != name:
-                                entry = f"{name} <{email}>"
-                            else:
-                                entry = name
-                            if recip.Type == 1:  # olRequired
-                                required.append(entry)
-                            elif recip.Type == 2:  # olOptional
-                                optional.append(entry)
-                        if required:
-                            print(f"Required: {'; '.join(required)}")
-                        if optional:
-                            print(f"Optional: {'; '.join(optional)}")
-                    except Exception:
-                        attendees = getattr(appt, 'RequiredAttendees', None)
-                        if attendees:
-                            print(f"Attendees: {attendees}")
-                    resp_map = {0: "None", 1: "Organized", 2: "Tentative", 3: "Accepted", 4: "Declined", 5: "Not Responded"}
-                    resp = getattr(appt, 'ResponseStatus', None)
-                    if resp is not None and resp in resp_map:
-                        print(f"Response: {resp_map[resp]}")
-                else:
-                    # Fallback to MAPI properties on the inbox item
-                    try:
-                        pa = email_item.PropertyAccessor
-                        start_val = pa.GetProperty(_MAPI_START)
-                        end_val = pa.GetProperty(_MAPI_END)
+                if not fields or 'date' in fields:
+                    rt = getattr(email_item, 'ReceivedTime', None)
+                    print(f"Received: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
+                # Meeting-specific fields
+                if is_meeting_item and (not fields or 'meeting' in fields):
+                    _MAPI_START = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820D0040'
+                    _MAPI_END = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820E0040'
+                    # Try GetAssociatedAppointment for full meeting details
+                    appt = None
+                    if message_class.startswith('IPM.Appointment'):
+                        appt = email_item
+                    else:
+                        try:
+                            appt = email_item.GetAssociatedAppointment(False)
+                        except Exception:
+                            pass
+                    if appt:
+                        start_val = getattr(appt, 'Start', None)
+                        end_val = getattr(appt, 'End', None)
                         if start_val:
                             s = start_val.replace(tzinfo=None)
                             e = end_val.replace(tzinfo=None) if end_val else None
@@ -557,57 +708,108 @@ def cmd_get_email(args):
                             if e:
                                 time_line += f" ~ {e}"
                             print(f"When: {time_line}")
-                    except Exception:
-                        pass
-            if not fields or 'body' in fields:
-                body = getattr(email_item, 'Body', '') or ''
-                if body.strip():
-                    print(f"\nBody:\n{body}")
-                elif is_meeting_item:
-                    print("\nBody: (empty — meeting details are stored in the calendar item, check Calendar for full info)")
-                else:
-                    print(f"\nBody:\n{body}")
-
-            attachments_count = 0
-            try:
-                attachments_count = email_item.Attachments.Count
-            except Exception:
-                pass
-            if (not fields or 'body' in fields) and attachments_count > 0:
-                regular = []
-                embedded = []
-                for i in range(1, email_item.Attachments.Count + 1):
-                    attach = email_item.Attachments.Item(i)
-                    if _is_embedded_image(attach):
-                        embedded.append(attach)
+                        loc = getattr(appt, 'Location', None)
+                        if loc:
+                            print(f"Location: {loc}")
+                        organizer = getattr(appt, 'Organizer', None)
+                        if organizer:
+                            print(f"Organizer: {organizer}")
+                        # Resolve attendees with email addresses via Recipients collection
+                        try:
+                            required = []
+                            optional = []
+                            for i in range(1, appt.Recipients.Count + 1):
+                                recip = appt.Recipients.Item(i)
+                                name = recip.Name or ''
+                                email = _get_smtp_address(recip)
+                                if email and email != name:
+                                    entry = f"{name} <{email}>"
+                                else:
+                                    entry = name
+                                if recip.Type == 1:  # olRequired
+                                    required.append(entry)
+                                elif recip.Type == 2:  # olOptional
+                                    optional.append(entry)
+                            if required:
+                                print(f"Required: {'; '.join(required)}")
+                            if optional:
+                                print(f"Optional: {'; '.join(optional)}")
+                        except Exception:
+                            attendees = getattr(appt, 'RequiredAttendees', None)
+                            if attendees:
+                                print(f"Attendees: {attendees}")
+                        resp_map = {0: "None", 1: "Organized", 2: "Tentative", 3: "Accepted", 4: "Declined", 5: "Not Responded"}
+                        resp = getattr(appt, 'ResponseStatus', None)
+                        if resp is not None and resp in resp_map:
+                            print(f"Response: {resp_map[resp]}")
                     else:
-                        regular.append(attach)
+                        # Fallback to MAPI properties on the inbox item
+                        try:
+                            pa = email_item.PropertyAccessor
+                            start_val = pa.GetProperty(_MAPI_START)
+                            end_val = pa.GetProperty(_MAPI_END)
+                            if start_val:
+                                s = start_val.replace(tzinfo=None)
+                                e = end_val.replace(tzinfo=None) if end_val else None
+                                time_line = str(s)
+                                if e:
+                                    time_line += f" ~ {e}"
+                                print(f"When: {time_line}")
+                        except Exception:
+                            pass
+                if not fields or 'body' in fields:
+                    body = getattr(email_item, 'Body', '') or ''
+                    if truncate_len is not None and len(body) > truncate_len:
+                        truncated_body = body[:truncate_len] + f"\n\n... [TRUNCATED to {truncate_len} chars]"
+                    else:
+                        truncated_body = body
+                    if body.strip():
+                        print(f"\nBody:\n{truncated_body}")
+                    elif is_meeting_item:
+                        print("\nBody: (empty — meeting details are stored in the calendar item, check Calendar for full info)")
+                    else:
+                        print(f"\nBody:\n{truncated_body}")
 
-                if regular:
-                    print(f"\n\U0001F4CE Attachments ({len(regular)}):")
-                    for attach in regular:
-                        size_kb = attach.Size / 1024
-                        print(f"  - {attach.FileName} ({size_kb:.1f} KB)")
+                attachments_count = 0
+                try:
+                    attachments_count = email_item.Attachments.Count
+                except Exception:
+                    pass
+                if (not fields or 'body' in fields) and attachments_count > 0:
+                    regular = []
+                    embedded = []
+                    for i in range(1, email_item.Attachments.Count + 1):
+                        attach = email_item.Attachments.Item(i)
+                        if _is_embedded_image(attach):
+                            embedded.append(attach)
+                        else:
+                            regular.append(attach)
 
-                if embedded:
-                    import tempfile
-                    temp_dir = os.path.join(tempfile.gettempdir(), "outlook_inline", email_id[:16])
-                    os.makedirs(temp_dir, exist_ok=True)
-                    print(f"\n\U0001F5BC  Embedded images (auto-saved):")
-                    used_names = set()
-                    for attach in embedded:
-                        filename = attach.FileName
-                        if filename in used_names:
-                            stem, ext = os.path.splitext(filename)
-                            counter = 2
-                            while f"{stem}_{counter}{ext}" in used_names:
-                                counter += 1
-                            filename = f"{stem}_{counter}{ext}"
-                        used_names.add(filename)
-                        save_path = os.path.join(temp_dir, filename)
-                        attach.SaveAsFile(save_path)
-                        size_kb = attach.Size / 1024
-                        print(f"  - {save_path} ({size_kb:.1f} KB)")
+                    if regular:
+                        print(f"\n\u1F4CE Attachments ({len(regular)}):")
+                        for attach in regular:
+                            size_kb = attach.Size / 1024
+                            print(f"  - {attach.FileName} ({size_kb:.1f} KB)")
+
+                    if embedded:
+                        import tempfile
+                        temp_dir = os.path.join(tempfile.gettempdir(), "outlook_inline", email_id[:16])
+                        os.makedirs(temp_dir, exist_ok=True)
+                        print(f"\n\u1F5BC  Embedded images (auto-saved):")
+                        used_names = set()
+                        for attach in embedded:
+                            filename = attach.FileName
+                            if filename in used_names:
+                                stem, ext = os.path.splitext(filename)
+                                counter = 2
+                                while f"{stem}_{counter}{ext}" in used_names:
+                                    counter += 1
+                                filename = f"{stem}_{counter}{ext}"
+                            used_names.add(filename)
+                            save_path = os.path.join(temp_dir, filename)
+                            attach.SaveAsFile(save_path)
+                            size_kb = attach.Size / 1024
+                            print(f"  - {save_path} ({size_kb:.1f} KB)")
 
         return 0
     except Exception as e:
@@ -852,9 +1054,20 @@ _FONT_STYLE = 'font-family:Calibri,sans-serif;font-size:11pt;'
 
 
 def _wrap_body_font(html_body: str) -> str:
-    """Wrap HTML body content in a div with consistent font styling."""
+    """Wrap body content in a styled div.
+
+    Plain text input is HTML-escaped and newlines become <br> so emails
+    preserve formatting when assigned to Outlook HTMLBody.
+    """
     if not html_body:
         return ""
+
+    # If caller passed plain text, preserve visible line breaks in HTML mail.
+    if not re.search(r'<[a-zA-Z][^>]*>', html_body):
+        html_body = html.escape(html_body)
+        html_body = html_body.replace('\r\n', '\n')
+        html_body = html_body.replace('\n', '<br>')
+
     return f'<div style="{_FONT_STYLE}">{html_body}</div>'
 
 
@@ -1003,17 +1216,81 @@ def _print_sent_entry_id(session, subject):
 
 
 def _resolve_body(args, required=True):
-    """Resolve body from --body-stdin or positional/flag body arg.
-    Priority: stdin > positional arg.
+    """Resolve body from transport mechanisms.
+
+    Priority:
+    1. --body-stdin-base64
+    2. --body-base64
+    3. --body-stdin
+    4. auto-detect stdin redirection (base64 or UTF-8 plain text)
+    5. direct body arg
+
     Returns True on success (args.body is set), False on error."""
+    if getattr(args, 'body_stdin_base64', False):
+        if not sys.stdin.isatty():
+            try:
+                raw = sys.stdin.buffer.read()
+                args.body = base64.b64decode(raw).decode('utf-8')
+            except Exception as exc:
+                print(f"Error: invalid base64 stdin payload: {exc}", file=sys.stderr)
+                return False
+        else:
+            print("Error: --body-stdin-base64 specified but no piped input detected.", file=sys.stderr)
+            return False
+
+    body_base64 = getattr(args, 'body_base64', None)
+    if body_base64:
+        try:
+            args.body = base64.b64decode(body_base64).decode('utf-8')
+        except Exception as exc:
+            print(f"Error: invalid --body-base64 payload: {exc}", file=sys.stderr)
+            return False
+
     if getattr(args, 'body_stdin', False):
         if not sys.stdin.isatty():
-            args.body = sys.stdin.read()
+            try:
+                args.body = sys.stdin.buffer.read().decode('utf-8')
+            except UnicodeDecodeError as exc:
+                print(f"Error: stdin is not valid UTF-8: {exc}", file=sys.stderr)
+                return False
         else:
             print("Error: --body-stdin specified but no piped input detected.", file=sys.stderr)
             return False
+
+    # Auto-detect stdin redirection if args.body is not set yet
+    if not args.body and not sys.stdin.isatty():
+        try:
+            raw_bytes = sys.stdin.buffer.read()
+            if raw_bytes:
+                # Try to auto-detect if it's base64 encoded text
+                try:
+                    decoded_str = raw_bytes.decode('ascii', errors='strict')
+                    # Base64 string characters check
+                    cleaned_str = re.sub(r'\s+', '', decoded_str)
+                    if re.match(r'^[A-Za-z0-9+/=]+$', cleaned_str) and len(cleaned_str) % 4 == 0:
+                        try:
+                            decoded_body = base64.b64decode(cleaned_str.encode('ascii')).decode('utf-8')
+                            # Ensure it doesn't look like raw binary bytes (e.g. control chars)
+                            if all(ord(c) >= 32 or c in '\r\n\t' for c in decoded_body):
+                                args.body = decoded_body
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Fallback to direct UTF-8 decoding of the stream if base64 didn't resolve
+                if not args.body:
+                    try:
+                        args.body = raw_bytes.decode('utf-8')
+                    except UnicodeDecodeError as exc:
+                        print(f"Error: redirected stdin is not valid UTF-8: {exc}", file=sys.stderr)
+                        return False
+        except Exception as exc:
+            print(f"Error reading redirected stdin: {exc}", file=sys.stderr)
+            return False
+
     if required and not args.body:
-        print("Error: body or --body-stdin is required.", file=sys.stderr)
+        print("Error: body or piped stdin is required.", file=sys.stderr)
         return False
     return True
 
@@ -1358,9 +1635,9 @@ def cmd_redirect(args):
 def cmd_create_folder(args):
     """Create a new folder"""
     try:
-        with OutlookSessionManager() as session:
-            result = session.create_folder(args.name, args.parent)
-            print(result)
+        from backend.outlook_session.folder_operations import create_folder
+        result = create_folder(args.name, args.parent)
+        print(result)
         return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -1452,7 +1729,7 @@ def cmd_lookup_contact(args):
             contact_info = get_contact_by_email(query)
             results = [contact_info] if contact_info else []
         else:
-            results = get_contact_by_name(query)
+            results = get_contact_by_name(query, include_all_matches=getattr(args, 'all_matches', False))
 
         if not results:
             print(f"No contact found for: {query}")
@@ -1802,7 +2079,28 @@ def cmd_send_draft(args):
                 print("Error: Draft has no recipients.", file=sys.stderr)
                 return 1
 
-            email_item.Send()
+            # Resolve all recipients before sending
+            print("Resolving recipients...")
+            resolved = email_item.Recipients.ResolveAll()
+            if not resolved:
+                print("Warning: Some recipients could not be automatically resolved. Checking status...", file=sys.stderr)
+                unresolved = []
+                for i in range(1, email_item.Recipients.Count + 1):
+                    recip = email_item.Recipients.Item(i)
+                    if not recip.Resolved:
+                        unresolved.append(recip.Name)
+                if unresolved:
+                    print(f"Error: Unresolved recipients found: {', '.join(unresolved)}", file=sys.stderr)
+                    print("Please open Outlook to manually resolve these names in the Drafts folder.", file=sys.stderr)
+                    return 1
+
+            try:
+                email_item.Send()
+            except Exception:
+                email_item.Display(False)
+                import time
+                time.sleep(0.5)
+                email_item.Send()
             print(f"✅ Email sent")
             print(f"   Subject: {subject}")
             print(f"   To: {to}")
@@ -2428,9 +2726,13 @@ def main():
     parser_list_recent.set_defaults(func=cmd_list_recent)
     
     # Search emails command
-    parser_search = subparsers.add_parser('find', help='Find emails by subject, sender, recipient, or body')
-    parser_search.add_argument('--type', required=True, choices=['subject', 'sender', 'recipient', 'body'], help='Search type')
-    parser_search.add_argument('--query', required=True, help='Search query')
+    parser_search = subparsers.add_parser('find', help='Find emails by sender, subject, recipient, or body')
+    parser_search.add_argument('--from', dest='from_', type=str, default=None, help='Search by sender name/email')
+    parser_search.add_argument('--subject', type=str, default=None, help='Search by subject')
+    parser_search.add_argument('--to', type=str, default=None, help='Search by recipient name/email')
+    parser_search.add_argument('--body', type=str, default=None, help='Search by body content')
+    parser_search.add_argument('--type', type=str, default=None, choices=['subject', 'sender', 'recipient', 'body'], help=argparse.SUPPRESS)
+    parser_search.add_argument('--query', type=str, default=None, help=argparse.SUPPRESS)
     parser_search.add_argument(
         '--days',
         type=int,
@@ -2441,7 +2743,7 @@ def main():
             f"allowed range: 1-{search_config.MAX_SEARCH_DAYS})"
         ),
     )
-    parser_search.add_argument('--folder', type=str, default=None, help='Folder name (default: Inbox)')
+    parser_search.add_argument('--folder', type=str, default=None, help='Folder name (default depends on field)')
     parser_search.add_argument('--folders', type=str, default=None, help='Comma-separated folder names for cross-folder search')
     parser_search.add_argument('--limit', type=int, default=None, help='Max number of results to return (default: all)')
     parser_search.add_argument('--match-all', action='store_true', default=True, help='Match all terms (AND logic)')
@@ -2449,9 +2751,10 @@ def main():
     
     # Get email command
     parser_get_email = subparsers.add_parser('get-email', aliases=['read'], help='Get full email details by ID')
-    parser_get_email.add_argument('email_id', nargs='?', default=None, help='Email ID from search results')
+    parser_get_email.add_argument('email_ids', nargs='*', default=[], help='One or more Email IDs from search results')
     parser_get_email.add_argument('--id', dest='email_id_flag', help='Email ID (alternative to positional)')
     parser_get_email.add_argument('--fields', help='Comma-separated fields to show (from,to,cc,subject,date,body)')
+    parser_get_email.add_argument('--truncate', type=int, default=None, help='Truncate the email body to N characters')
     parser_get_email.set_defaults(func=cmd_get_email)
     
     # Reply command (default: reply-all; --only: sender only)
@@ -2459,6 +2762,8 @@ def main():
     parser_reply.add_argument('email_id', help='Email ID from search results')
     parser_reply.add_argument('body', nargs='?', default=None, help='Reply text in HTML format')
     parser_reply.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
+    parser_reply.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
+    parser_reply.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
     parser_reply.add_argument('--to', help='Additional To recipients (comma separated)')
     parser_reply.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_reply.add_argument('--attach', help='File path(s) to attach (comma separated)')
@@ -2474,6 +2779,8 @@ def main():
     parser_compose.add_argument('--subject', required=True, help='Email subject')
     parser_compose.add_argument('--body', help='Email body')
     parser_compose.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
+    parser_compose.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
+    parser_compose.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
     parser_compose.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_compose.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_compose.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
@@ -2488,6 +2795,8 @@ def main():
     parser_forward.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_forward.add_argument('--body', help='Custom message to prepend')
     parser_forward.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
+    parser_forward.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
+    parser_forward.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_forward.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
     parser_forward.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
@@ -2500,6 +2809,8 @@ def main():
     parser_redirect.add_argument('email_id', help='Email ID from search results')
     parser_redirect.add_argument('body', nargs='?', default=None, help='Message body in HTML format')
     parser_redirect.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
+    parser_redirect.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
+    parser_redirect.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
     parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_redirect.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')
@@ -2543,6 +2854,8 @@ def main():
     # Lookup contact command
     parser_lookup = subparsers.add_parser('lookup-contact', help='Look up contact information by email or display name')
     parser_lookup.add_argument('query', help='Email address or display name to look up')
+    parser_lookup.add_argument('--all', dest='all_matches', action='store_true', help='Search GAL for all nearby matches; slower')
+    parser_lookup.add_argument('--timeout', type=int, default=None, help='Max seconds to allow lookup before stopping')
     parser_lookup.set_defaults(func=cmd_lookup_contact)
 
     # Find thread command
@@ -2642,7 +2955,10 @@ def main():
     if not args.command:
         parser.print_help()
         return 1
-    
+
+    if _should_isolate_outlook_command(args):
+        return _run_outlook_command_isolated(args)
+
     # Execute command
     return args.func(args)
 
