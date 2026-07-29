@@ -299,6 +299,43 @@ def _detect_event_from_body(body_text: str) -> bool:
     return any(p in lower for p in patterns)
 
 
+def _get_smtp_address(recipient) -> str:
+    """Helper to safely extract the SMTP address of a Recipient or AddressEntry."""
+    try:
+        address = getattr(recipient, 'Address', '')
+        if address and address.startswith("/o="):
+            ae = getattr(recipient, 'AddressEntry', None)
+            if ae:
+                user = ae.GetExchangeUser()
+                if user and user.PrimarySmtpAddress:
+                    return user.PrimarySmtpAddress
+        return address or ""
+    except Exception:
+        try:
+            return getattr(recipient, 'Address', '')
+        except Exception:
+            return ""
+
+
+def _get_sender_smtp(item) -> str:
+    """Helper to safely extract the sender's SMTP address."""
+    try:
+        email_type = getattr(item, 'SenderEmailType', '')
+        email_address = getattr(item, 'SenderEmailAddress', '')
+        if email_type == "EX":
+            sender = getattr(item, 'Sender', None)
+            if sender:
+                user = sender.GetExchangeUser()
+                if user and user.PrimarySmtpAddress:
+                    return user.PrimarySmtpAddress
+        return email_address or ""
+    except Exception:
+        try:
+            return getattr(item, 'SenderEmailAddress', '')
+        except Exception:
+            return ""
+
+
 def extract_email_info(item) -> Dict[str, Any]:
     """Extract basic email information from an Outlook item with optimized COM access."""
     # OPTIMIZATION: Bulk extract all basic attributes in single COM access
@@ -307,6 +344,7 @@ def extract_email_info(item) -> Dict[str, Any]:
         entry_id = getattr(item, 'EntryID', '')
         subject = getattr(item, 'Subject', 'No Subject')
         sender = getattr(item, 'SenderName', 'Unknown')
+        sender_email = _get_sender_smtp(item)
         received_time = getattr(item, 'ReceivedTime', None)
         folder_name = _get_folder_name(item)
         conversation_id = _get_conversation_id(item)
@@ -317,6 +355,7 @@ def extract_email_info(item) -> Dict[str, Any]:
             "entry_id": entry_id,
             "subject": subject,
             "sender": sender,
+            "sender_email": sender_email,
             "received_time": str(received_time.replace(tzinfo=None)) if received_time else "Unknown",
             "folder": folder_name,
             "conversation_id": conversation_id,
@@ -355,7 +394,7 @@ def extract_email_info(item) -> Dict[str, Any]:
                 for recipient in recipients:
                     if _get_cached_com_attribute(recipient, 'Type') == 1:  # 1 = To recipient
                         recipient_info = {
-                            "address": _get_cached_com_attribute(recipient, 'Address', ''),
+                            "address": _get_smtp_address(recipient),
                             "name": _get_cached_com_attribute(recipient, 'Name', '')
                         }
                         if recipient_info["address"] or recipient_info["name"]:
@@ -393,7 +432,7 @@ def extract_email_info(item) -> Dict[str, Any]:
                 for recipient in recipients:
                     if _get_cached_com_attribute(recipient, 'Type') == 2:  # 2 = CC recipient
                         recipient_info = {
-                            "address": _get_cached_com_attribute(recipient, 'Address', ''),
+                            "address": _get_smtp_address(recipient),
                             "name": _get_cached_com_attribute(recipient, 'Name', '')
                         }
                         if recipient_info["address"] or recipient_info["name"]:

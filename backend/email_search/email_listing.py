@@ -21,7 +21,7 @@ from .search_common import (
 logger = get_logger(__name__)
 
 
-def list_recent_emails(folder_name: str = "Inbox", days: int = None) -> Tuple[List[Dict[str, Any]], str]:
+def list_recent_emails(folder_name: str = "Inbox", days: int = None, limit: int = None) -> Tuple[List[Dict[str, Any]], str]:
     """Public interface for listing emails.
     Returns (emails, message) tuple with emails containing message_id.
     """
@@ -38,14 +38,14 @@ def list_recent_emails(folder_name: str = "Inbox", days: int = None) -> Tuple[Li
         raise ValueError(f"Invalid parameters: {e}")
 
     # Load emails from Outlook
-    emails, note = get_emails_from_folder_optimized(folder_name=params.folder_name, days=params.days)
+    emails, note = get_emails_from_folder_optimized(folder_name=params.folder_name, days=params.days, limit=limit)
     
     days_str = f" from last {params.days} days" if params.days else ""
     
     return emails, f"Found {len(emails)} emails in '{params.folder_name}'{days_str}"
 
 
-def list_recent_emails_multi(folder_names: list = None, days: int = None) -> Tuple[List[Dict[str, Any]], str]:
+def list_recent_emails_multi(folder_names: list = None, days: int = None, limit: int = None) -> Tuple[List[Dict[str, Any]], str]:
     """List recent emails from multiple folders (default: Inbox + Sent Items).
     Returns (emails, message) tuple. Each email dict includes 'folder_name'.
     """
@@ -59,7 +59,8 @@ def list_recent_emails_multi(folder_names: list = None, days: int = None) -> Tup
     seen_ids = set()
 
     for fname in folder_names:
-        emails, _ = get_emails_from_folder_optimized(folder_name=fname, days=effective_days)
+        # If we have a limit, we can pass it down as well
+        emails, _ = get_emails_from_folder_optimized(folder_name=fname, days=effective_days, limit=limit)
         for email in emails:
             eid = email.get("entry_id", "")
             if eid and eid not in seen_ids:
@@ -69,11 +70,14 @@ def list_recent_emails_multi(folder_names: list = None, days: int = None) -> Tup
 
     all_emails.sort(key=lambda x: x.get("received_time", ""), reverse=True)
 
+    if limit and len(all_emails) > limit:
+        all_emails = all_emails[:limit]
+
     folder_label = " + ".join(folder_names)
     return all_emails, f"Found {len(all_emails)} emails in '{folder_label}' from last {effective_days} days"
 
 
-def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7) -> Tuple[List[Dict[str, Any]], str]:
+def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7, limit: int = None) -> Tuple[List[Dict[str, Any]], str]:
     """
     Optimized version of get_emails_from_folder with performance improvements.
     
@@ -119,7 +123,9 @@ def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7) 
             batch_size = get_optimal_batch_size(total_items, params.days)
             
             # OPTIMIZATION 2: Adjust max_items based on days requested
-            if params.days and params.days <= 1:
+            if limit:
+                max_items = limit
+            elif params.days and params.days <= 1:
                 max_items = 200  # For 1-day searches, 200 items is sufficient
             elif params.days and params.days <= 3:
                 max_items = 500  # For 3-day searches, increase to 500

@@ -25,6 +25,7 @@ operations: ["find-recent", "find", "compose", "reply", "forward", "redirect", "
 
 > **⚠️ ALL emails use HTML format:** `<p>text</p>`, `<br>`, `<strong>bold</strong>`
 > **⚠️ No closing or signature in email body** — Outlook auto-appends signature. Do not add "Thanks, Marlon" or similar.
+> **Codex execution:** Outlook COM requires the interactive Outlook desktop session. In Codex, run Outlook-backed commands with desktop/elevated execution directly; do not try the background sandbox first.
 
 ## Terminology
 
@@ -134,31 +135,37 @@ py -3 scripts/outlook_skill.py lookup-contact "HONG YANG"
 
 ### Reply
 
-The **default and preferred** way is to pass the message directly via the `--body` argument. This avoids console/pipe encoding and escaping issues entirely for standard emails.
+The **preferred Codex/PowerShell method** is to build the current body in memory, encode it as UTF-8 Base64, and pass it via `--body-base64`. This avoids console/pipe encoding issues and avoids stale temp body files. Direct `--body` is acceptable only for short, single-line HTML.
 
 ```powershell
-py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Thank you for the update.</p>"
-py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Approved, please proceed.</p>" --cc "extra@ibm.com"
-py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Please see attachment.</p>" --attach "C:\path\file.pdf"
-py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Action required.</p>" --importance high
-py -3 scripts/outlook_skill.py reply "<email_id>" --body "<p>Done.</p>" --only
+$body = "<p>Thank you for the update.</p>"
+$body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-base64 $body64
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-base64 $body64 --cc "extra@ibm.com"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-base64 $body64 --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-base64 $body64 --importance high
+py -3 scripts/outlook_skill.py reply "<email_id>" --body-base64 $body64 --only
 ```
 
 - **Default: reply-all** — keeps ALL original To + CC recipients. `--to`/`--cc` APPEND to existing.
 - **`--only`: reply to From (sender) only** — use only when user explicitly asks to narrow.
 - `--attach`: File path(s) to attach (comma separated for multiple).
 - `--importance`: Set priority flag (`high` or `low`) — shows ❗ in recipient's inbox.
+- `reply` logs progress steps to stderr for timeout diagnosis.
+- `reply` prints the Sent Items EntryID by default after sending.
 - **⚠️ ALWAYS show draft to user first — NEVER send before user approval**
 
 ### Compose Email
 
-The **default and preferred** way is to pass the message directly via the `--body` argument.
+The **preferred Codex/PowerShell method** is `--body-base64`. Direct `--body` is acceptable only for short, single-line HTML.
 
 ```powershell
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>Message text.</p>"
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>See attached.</p>" --attach "C:\path\file.pdf"
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>Urgent request.</p>" --importance high
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>Embed image:<br><img src='cid:pic1'></p>" --inline-image "C:\path\img.png:pic1"
+$body = "<p>Message text.</p>"
+$body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-base64 $body64
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-base64 $body64 --attach "C:\path\file.pdf"
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-base64 $body64 --importance high
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-base64 $body64 --inline-image "C:\path\img.png:pic1"
 ```
 
 - `--attach`: File path(s) to attach (comma separated for multiple)
@@ -172,15 +179,16 @@ py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>
 ### Forward (single)
 
 ```powershell
-py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com"
-py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com" --cc "manager@ibm.com" --body "<p>FYI, forwarding this thread.</p>"
+$body = "<p>FYI, forwarding this thread.</p>"
+$body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+py -3 scripts/outlook_skill.py forward "<email_id>" --to "user1@ibm.com" --cc "manager@ibm.com" --body-base64 $body64
 py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com" --attach "C:\path\file.pdf"
 ```
 
 - Forwards an email to specified recipients
 - `--to` (required): Comma-separated list of To recipients
 - `--cc` (optional): Comma-separated list of CC recipients
-- `--body` (optional): Custom HTML message to prepend
+- `--body-base64` (preferred for send operations): Base64 encoded UTF-8 custom HTML message to prepend. `--body` is acceptable only for short, single-line HTML.
 - `--attach` (optional): File path(s) to attach (comma separated for multiple)
 - Subject auto-prefixed with `FW:`
 - Preserves original email formatting
@@ -189,11 +197,13 @@ py -3 scripts/outlook_skill.py forward "<email_id>" --to "user@domain.com" --att
 ### Batch Forward
 
 ```powershell
-py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --message "<p>HTML body</p>"
+$message = "<p>HTML body</p>"
+$message64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($message))
+py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --body-base64 $message64
 ```
 
 - CSV: single column named "email" (supports BOM encoding)
-- `--message`: Optional HTML message to prepend (same format as reply)
+- `--body-base64` (preferred for send operations): Optional Base64 encoded UTF-8 HTML message to prepend (same format as reply). `--message-base64` is accepted as an alias. `--message` is acceptable only for short, single-line HTML.
 - Uses BCC for privacy
 - Preserves original email formatting
 - Automatically splits large recipient lists into batches
@@ -202,13 +212,14 @@ py -3 scripts/outlook_skill.py batch-forward "<email_id>" "recipients.csv" --mes
 ### Redirect (Clear Recipients + New TO/CC)
 
 ```powershell
-py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com,c@d.com" --body "<p>Redirecting thread.</p>"
-py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com" --cc "b@b.com" --body "<p>Please handle.</p>"
+$body = "<p>Please handle.</p>"
+$body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+py -3 scripts/outlook_skill.py redirect "<email_id>" --to "a@b.com" --cc "b@b.com" --body-base64 $body64
 ```
 
 - Clears all existing TO and CC recipients, then adds new ones
 - Preserves original email body as quoted content (like forward)
-- `--body` (optional): HTML message prepended above original content
+- `--body-base64` (preferred for send operations): Base64 encoded UTF-8 HTML message prepended above original content. `--body` is acceptable only for short, single-line HTML.
 - `--to` (required): New TO recipients (comma separated)
 - `--cc`: New CC recipients (comma separated)
 - `--attach`: File path(s) to attach (comma separated)
@@ -343,7 +354,9 @@ py -3 scripts/outlook_skill.py respond-meeting "<meeting_entry_id>" --action pro
 
 ### Sending Inline Images
 ```bash
-py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body "<p>HTML with <img src='cid:myimage'></p>" --inline-image "C:\path\image.png:myimage"
+$body = "<p>HTML with <img src='cid:myimage'></p>"
+$body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+py -3 scripts/outlook_skill.py compose --to "email" --subject "text" --body-base64 $body64 --inline-image "C:\path\image.png:myimage"
 ```
 - `--inline-image`: Format is `filepath:cid_name` (comma separated for multiple)
 - Reference in HTML body via `<img src="cid:cid_name">`
@@ -381,65 +394,52 @@ class BatchConfig:
 <p>Best regards,<br>Marlon</p>
 ```
 
-**Lists — NO `<ul><li>`:** Outlook adds excessive spacing between list items. Use `<br>` with bullet characters:
+**Lists — NO `<ul><li>`:** Outlook adds excessive spacing between list items. Use `<br>` with plain ASCII hyphens (`-`) instead of decorative bullets:
 
 ```html
 <!-- ✅ CORRECT -->
-<p>• Item one<br>
-• Item two<br>
-• Item three</p>
+<p>- Item one<br>
+- Item two<br>
+- Item three</p>
 
 <!-- ❌ WRONG: huge gaps in Outlook -->
 <ul><li>Item one</li><li>Item two</li></ul>
 ```
 
-## ⚠️ Special Characters in Email Body
+## Special Characters in Email Body
 
-**CRITICAL:** Always use `--body-stdin` with a **here-string** (PowerShell) or **heredoc** (Git Bash) to pass email body content. This prevents all shell variable expansion/interpolation and handles any special character safely.
+**Windows/PowerShell rule:** Do not pipe normal PowerShell strings into `--body-stdin` for send operations when the body contains non-ASCII characters. The native-command pipe can pass text through a console code page and silently convert characters such as bullets, curly apostrophes, em dashes, and Chinese characters to `?`.
 
-> ℹ️ **Note:** The Outlook COM skill is strictly **Windows-only** (as it relies on Microsoft Outlook COM APIs). The workflows below are categorized by the Windows shell you are running.
+**Preferred safe method for Codex / PowerShell: `--body-base64`**
 
-### 1. Windows PowerShell Workflow (Native Shell — Preferred)
-
-Use a single-quoted here-string (`@' ... '@`). Single quotes prevent PowerShell from performing any variable expansion (preserving `$` signs, quotes, and backticks).
+- Build the current draft body in a PowerShell variable.
+- Encode that exact variable as UTF-8 Base64.
+- Pass the Base64 string with `--body-base64`.
+- The CLI decodes it back to UTF-8 before writing the Outlook HTML body.
+- No temp file is used, so there is no stale-file risk.
 
 ```powershell
-# ✅ CORRECT (PowerShell): Single-quoted here-string preserves all special chars
 $body = @'
-<p>Cost: $80,000 — preserves $0, $VAR, and all special chars like apostrophes (I'm, don't)</p>
+<p>Support ticket path:<br>
+- Go to https://connect.redhat.com/en/support<br>
+- Select I don't have an account for faster response<br>
+- Select General Support<br>
+- Select User Access</p>
 '@
+$body64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body))
+py -3 scripts/outlook_skill.py reply "<id>" --body-base64 $body64
+```
+
+**Direct `--body` is also safe for short, single-line HTML** because Windows command-line arguments are Unicode. For long multi-line bodies, prefer `--body-base64` to avoid quoting/newline problems.
+
+**Avoid for send operations in PowerShell:**
+
+```powershell
+# WRONG for non-ASCII: may turn bullets/curly quotes into ?
 $body | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
 ```
 
-### 2. Git Bash on Windows Workflow (Bash Shell)
-
-If you are using Git Bash on Windows, use a heredoc with a quoted delimiter (`<<'EOF'`). Quoting the delimiter prevents Bash from executing variable/command substitutions.
-
-```bash
-# ✅ CORRECT (Git Bash): Heredoc with quoted delimiter preserves all special chars
-cat <<'EOF' | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
-<p>Cost: $80,000 — preserves $0, $VAR, and all special chars like apostrophes (I'm, don't)</p>
-EOF
-```
-
-### ❌ Incorrect Patterns (Avoid)
-
-```powershell
-# ❌ WRONG: double-quoted echo — shell expands $0 and $VAR, causing blank outputs or errors
-echo "Cost: $80,000" | py -3 scripts/outlook_skill.py reply "<id>" --body-stdin
-
-# ❌ WRONG: inline body arg — same expansion problem, plus command length / escaping issues
-py -3 scripts/outlook_skill.py reply "<id>" "Cost: $80,000"
-```
-
-**Why not single quotes?** `echo '...'` works for `$` in Git Bash but breaks if the body contains apostrophes (`I'm`, `don't`). Here-strings / heredocs handle both.
-
-**Fallback (if stdin piping is unavailable):** Replace `$` with `&#36;` in the body text.
-
-### Non-ASCII Characters (UTF-8)
-
-The script reconfigures stdin to UTF-8, so em dashes (`—`), curly quotes, and other non-ASCII characters are supported in `--body-stdin` bodies. No special handling needed — just pipe normally via `echo "..." | py -3 ...`.
-
+**Style rule:** Prefer plain ASCII hyphens (`-`) and straight apostrophes (`'`) in outbound email bodies unless special characters are necessary.
 ## Find Workflow for Email Addresses
 
 1. Lookup display name: `lookup-contact "user@domain.com"`

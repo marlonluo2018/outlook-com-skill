@@ -20,6 +20,57 @@ _MAPI_START_PROP = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C00
 _MAPI_END_PROP = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820E0040'
 
 
+def _get_sender_smtp(item) -> str:
+    """Helper to safely extract the sender's SMTP address."""
+    try:
+        email_type = getattr(item, 'SenderEmailType', '')
+        email_address = getattr(item, 'SenderEmailAddress', '')
+        if email_type == "EX":
+            sender = getattr(item, 'Sender', None)
+            if sender:
+                user = sender.GetExchangeUser()
+                if user and user.PrimarySmtpAddress:
+                    return user.PrimarySmtpAddress
+        return email_address or ""
+    except Exception:
+        try:
+            return getattr(item, 'SenderEmailAddress', '')
+        except Exception:
+            return ""
+
+
+def _get_recipients_parallel(item):
+    """Helper to safely extract resolved To and CC recipients with SMTP."""
+    to_list = []
+    cc_list = []
+    try:
+        recipients = getattr(item, 'Recipients', None)
+        if recipients:
+            for recipient in recipients:
+                try:
+                    # Get type: 1 = To, 2 = CC
+                    rec_type = getattr(recipient, 'Type', 1)
+                    name = getattr(recipient, 'Name', '')
+                    address = getattr(recipient, 'Address', '')
+                    # Resolve SMTP if EX address
+                    if address and address.startswith("/o="):
+                        ae = getattr(recipient, 'AddressEntry', None)
+                        if ae:
+                            user = ae.GetExchangeUser()
+                            if user and user.PrimarySmtpAddress:
+                                address = user.PrimarySmtpAddress
+                    recipient_info = {"name": name, "address": address}
+                    if rec_type == 1:
+                        to_list.append(recipient_info)
+                    elif rec_type == 2:
+                        cc_list.append(recipient_info)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return to_list, cc_list
+
+
 def _meeting_status_label(raw: int) -> str:
     """Convert raw MeetingStatus int to string label matching search_common convention."""
     if raw == 3:
@@ -38,6 +89,7 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
         entry_id = item_data.get('EntryID', '')
         subject = item_data.get('Subject', 'No Subject')
         sender = item_data.get('SenderName', 'Unknown')
+        sender_email = item_data.get('SenderEmail', '')
         received_time = item_data.get('ReceivedTime', None)
         
         # Extract recipients - handle both formats
@@ -83,6 +135,7 @@ def _extract_email_info_parallel(item_data: Dict[str, Any]) -> Dict[str, Any]:
             "entry_id": entry_id,
             "subject": subject,
             "sender": sender,
+            "sender_email": sender_email,
             "received_time": str(received_time.replace(tzinfo=None)) if received_time else "Unknown",
             "start_time": start_str,
             "end_time": end_str,
@@ -160,15 +213,19 @@ def extract_emails_parallel(items: List[Any], max_workers: int = 4) -> List[Dict
                 except Exception:
                     pass
 
+                to_rec_list, cc_rec_list = _get_recipients_parallel(item)
                 item_dict = {
                     'EntryID': getattr(item, 'EntryID', ''),
                     'Subject': getattr(item, 'Subject', 'No Subject'),
                     'SenderName': getattr(item, 'SenderName', 'Unknown'),
+                    'SenderEmail': _get_sender_smtp(item),
                     'ReceivedTime': getattr(item, 'ReceivedTime', None),
                     'Start': start_val,
                     'End': end_val,
                     'To': to_val,
                     'CC': cc_val,
+                    'to_recipients': to_rec_list,
+                    'cc_recipients': cc_rec_list,
                     'UnRead': getattr(item, 'UnRead', False),
                     'MessageClass': getattr(item, 'MessageClass', ''),
                     'MeetingStatus': getattr(item, 'MeetingStatus', 0),
@@ -297,37 +354,13 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
                 
             subject = getattr(item, 'Subject', 'No Subject') or 'No Subject'
             sender = getattr(item, 'SenderName', 'Unknown') or 'Unknown'
+            sender_email = _get_sender_smtp(item)
             
             received_time = getattr(item, 'ReceivedTime', None)
             received_str = str(received_time.replace(tzinfo=None)) if received_time else "Unknown"
             
-            # Extract recipient information (To/CC can throw on meeting items)
-            try:
-                to_field = getattr(item, 'To', '') or ''
-            except Exception:
-                to_field = ''
-            try:
-                cc_field = getattr(item, 'CC', '') or ''
-            except Exception:
-                cc_field = ''
-            
-            # Parse recipients from To field
-            to_recipients = []
-            if to_field:
-                try:
-                    to_list = str(to_field).split(';')
-                    to_recipients = [{"address": addr.strip(), "name": addr.strip()} for addr in to_list if addr.strip()]
-                except Exception:
-                    to_recipients = []
-            
-            # Parse recipients from CC field
-            cc_recipients = []
-            if cc_field:
-                try:
-                    cc_list = str(cc_field).split(';')
-                    cc_recipients = [{"address": addr.strip(), "name": addr.strip()} for addr in cc_list if addr.strip()]
-                except Exception:
-                    cc_recipients = []
+            # Extract recipient information via Recipients collection
+            to_recipients, cc_recipients = _get_recipients_parallel(item)
             
             # Extract attachment info with embedded image detection
             has_attachments = False
@@ -427,6 +460,7 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
                 "entry_id": entry_id,
                 "subject": subject,
                 "sender": sender,
+                "sender_email": sender_email,
                 "received_time": received_str,
                 "start_time": start_str,
                 "end_time": end_str,

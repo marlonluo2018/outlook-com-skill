@@ -188,9 +188,9 @@ def cmd_list_recent(args):
     """List recent emails with their IDs"""
     try:
         if args.folder:
-            emails, message = list_recent_emails(args.folder, args.days)
+            emails, message = list_recent_emails(args.folder, args.days, limit=args.limit)
         else:
-            emails, message = list_recent_emails_multi(days=args.days)
+            emails, message = list_recent_emails_multi(days=args.days, limit=args.limit)
 
         if args.limit and len(emails) > args.limit:
             emails = emails[:args.limit]
@@ -350,11 +350,15 @@ def _display_email_list(emails, show_folder=True):
 
         subject = email_data.get('subject', 'No Subject')
         sender = email_data.get('sender', 'Unknown')
+        sender_email = email_data.get('sender_email')
         received = email_data.get('received_time', 'Unknown')
 
         print(f"ID: {email_id}")
         print(f"Subject: {subject}")
-        print(f"From: {sender}")
+        if sender_email:
+            print(f"From: {sender} <{sender_email}>")
+        else:
+            print(f"From: {sender}")
 
         to_recipients = email_data.get('to_recipients', [])
         if to_recipients:
@@ -364,7 +368,10 @@ def _display_email_list(emails, show_folder=True):
                 address = recipient.get('address', '')
                 display_name = extract_display_name(name) if name else extract_display_name(address)
                 if display_name:
-                    to_list.append(display_name)
+                    if address and "@" in address:
+                        to_list.append(f"{display_name} <{address}>")
+                    else:
+                        to_list.append(display_name)
             if to_list:
                 print(f"To: {'; '.join(to_list)}")
 
@@ -376,7 +383,10 @@ def _display_email_list(emails, show_folder=True):
                 address = recipient.get('address', '')
                 display_name = extract_display_name(name) if name else extract_display_name(address)
                 if display_name:
-                    cc_list.append(display_name)
+                    if address and "@" in address:
+                        cc_list.append(f"{display_name} <{address}>")
+                    else:
+                        cc_list.append(display_name)
             if cc_list:
                 print(f"CC: {'; '.join(cc_list)}")
 
@@ -670,18 +680,54 @@ def cmd_get_email(args):
                         print(f"From: {sender_name}")
                 if not fields or 'to' in fields:
                     try:
-                        to_val = email_item.To
-                        if to_val:
-                            print(f"To: {to_val}")
+                        to_recips = []
+                        for i in range(1, email_item.Recipients.Count + 1):
+                            recip = email_item.Recipients.Item(i)
+                            if recip.Type == 1: # olTo
+                                name = recip.Name or ''
+                                email = _get_smtp_address(recip)
+                                if email and email != name:
+                                    to_recips.append(f"{name} <{email}>")
+                                else:
+                                    to_recips.append(name)
+                        if to_recips:
+                            print(f"To: {'; '.join(to_recips)}")
+                        else:
+                            to_val = email_item.To
+                            if to_val:
+                                print(f"To: {to_val}")
                     except Exception:
-                        print("To: (unavailable — calendar item)")
+                        try:
+                            to_val = email_item.To
+                            if to_val:
+                                print(f"To: {to_val}")
+                        except Exception:
+                            print("To: (unavailable — calendar item)")
                 if not fields or 'cc' in fields:
                     try:
-                        cc_val = email_item.CC
-                        if cc_val:
-                            print(f"CC: {cc_val}")
+                        cc_recips = []
+                        for i in range(1, email_item.Recipients.Count + 1):
+                            recip = email_item.Recipients.Item(i)
+                            if recip.Type == 2: # olCC
+                                name = recip.Name or ''
+                                email = _get_smtp_address(recip)
+                                if email and email != name:
+                                    cc_recips.append(f"{name} <{email}>")
+                                else:
+                                    cc_recips.append(name)
+                        if cc_recips:
+                            print(f"CC: {'; '.join(cc_recips)}")
+                        else:
+                            cc_val = email_item.CC
+                            if cc_val:
+                                print(f"CC: {cc_val}")
                     except Exception:
-                        pass
+                        try:
+                            cc_val = email_item.CC
+                            if cc_val:
+                                print(f"CC: {cc_val}")
+                        except Exception:
+                            pass
                 if not fields or 'date' in fields:
                     rt = getattr(email_item, 'ReceivedTime', None)
                     print(f"Received: {rt.replace(tzinfo=None) if rt else 'Unknown'}")
@@ -1183,11 +1229,65 @@ def _build_reply_header(email_item, current_user_email):
     return header
 
 
-def _print_sent_entry_id(session, subject):
-    """Retrieve and print EntryID of the most recently sent email."""
+def _bare_subject(subject):
+    return re.sub(r'^(RE:\s*|FW:\s*)+', '', subject or '', flags=re.IGNORECASE)
+
+
+def _sent_on_to_utc(sent_on):
+    from datetime import timezone
+    if hasattr(sent_on, 'astimezone'):
+        return sent_on.astimezone(timezone.utc)
+    return sent_on.replace(tzinfo=timezone.utc)
+
+
+def _collect_recent_sent_entry_ids(session, subject=None, seconds=300, max_items=100):
+    """Snapshot recent Sent Items EntryIDs before sending.
+
+    This prevents a post-send lookup from returning an older email with the
+    same subject when repeated tests or retries happen within the lookup
+    window.
+    """
+    from datetime import datetime, timedelta, timezone
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    bare_subject = _bare_subject(subject)
+    entry_ids = set()
+    try:
+        ns = session.outlook.GetNamespace("MAPI")
+        sent_folder = ns.GetDefaultFolder(5)  # 5 = olFolderSentMail
+        items = sent_folder.Items
+        items.Sort("[SentOn]", True)
+        item = items.GetFirst()
+        scanned = 0
+        while item and scanned < max_items:
+            scanned += 1
+            sent_utc = _sent_on_to_utc(item.SentOn)
+            if sent_utc < threshold:
+                break
+            if not subject or bare_subject in _bare_subject(getattr(item, 'Subject', '')):
+                entry_id = getattr(item, 'EntryID', None)
+                if entry_id:
+                    entry_ids.add(entry_id)
+            item = items.GetNext()
+    except Exception:
+        pass
+    return entry_ids
+
+
+def _print_sent_entry_id(session, subject, sent_after=None, exclude_entry_ids=None):
+    """Retrieve and print EntryID of the newly sent email.
+
+    If exclude_entry_ids is provided, only a Sent Items entry that was not
+    present before Send() is eligible. This avoids printing the same EntryID
+    for consecutive sends with the same subject.
+    """
     import time
     from datetime import datetime, timedelta, timezone
-    threshold = datetime.now(timezone.utc) - timedelta(seconds=90)
+    exclude_entry_ids = set(exclude_entry_ids or [])
+    threshold = sent_after or (datetime.now(timezone.utc) - timedelta(seconds=90))
+    # Outlook/Exchange timestamps can lag slightly; allow a tiny tolerance,
+    # while exclude_entry_ids still blocks older already-seen messages.
+    threshold = threshold - timedelta(seconds=5)
+    bare_subject = _bare_subject(subject)
     for attempt in range(15):
         time.sleep(2)
         try:
@@ -1196,36 +1296,58 @@ def _print_sent_entry_id(session, subject):
             items = sent_folder.Items
             items.Sort("[SentOn]", True)
             item = items.GetFirst()
-            if not item:
-                continue
-            sent_on = item.SentOn
-            if hasattr(sent_on, 'astimezone'):
-                sent_utc = sent_on.astimezone(timezone.utc)
-            else:
-                sent_utc = sent_on.replace(tzinfo=timezone.utc)
-            import re
-            bare_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', subject or '', flags=re.IGNORECASE)
-            bare_item_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', item.Subject or '', flags=re.IGNORECASE)
-            if sent_utc >= threshold and (not subject or bare_subject in bare_item_subject):
-                local_time = sent_on if sent_on.tzinfo else sent_on.replace(tzinfo=None)
-                print(f"SentOn: {local_time.strftime('%a %b %d, %Y %H:%M')}")
-                print(f"EntryID: {item.EntryID}")
-                return
+            while item:
+                sent_on = item.SentOn
+                sent_utc = _sent_on_to_utc(sent_on)
+                if sent_utc < threshold:
+                    break
+                entry_id = getattr(item, 'EntryID', None)
+                if entry_id in exclude_entry_ids:
+                    item = items.GetNext()
+                    continue
+                bare_item_subject = _bare_subject(getattr(item, 'Subject', ''))
+                if not subject or bare_subject in bare_item_subject:
+                    local_time = sent_on if sent_on.tzinfo else sent_on.replace(tzinfo=None)
+                    print(f"SentOn: {local_time.strftime('%a %b %d, %Y %H:%M')}")
+                    print(f"EntryID: {entry_id}")
+                    return entry_id
+                item = items.GetNext()
         except Exception:
             pass
+    print("Warning: sent EntryID lookup did not find a new matching Sent Items entry.", file=sys.stderr)
+    return None
 
+
+def _reply_step(message):
+    print(f"[reply] {message}", file=sys.stderr, flush=True)
 
 def _resolve_body(args, required=True):
     """Resolve body from transport mechanisms.
 
     Priority:
-    1. --body-stdin-base64
-    2. --body-base64
-    3. --body-stdin
-    4. auto-detect stdin redirection (base64 or UTF-8 plain text)
-    5. direct body arg
+    1. --body-file
+    2. --body-stdin-base64
+    3. --body-base64
+    4. --body-stdin
+    5. auto-detect stdin redirection (base64 or UTF-8 plain text)
+    6. direct body arg
 
     Returns True on success (args.body is set), False on error."""
+    body_file = getattr(args, 'body_file', None)
+    if body_file:
+        try:
+            from pathlib import Path
+            p = Path(body_file)
+            if p.is_file():
+                args.body = p.read_text(encoding='utf-8')
+                print(f"[resolve_body] loaded body from file: {body_file} ({len(args.body)} chars)", file=sys.stderr)
+            else:
+                print(f"Error: body file not found: {body_file}", file=sys.stderr)
+                return False
+        except Exception as exc:
+            print(f"Error reading body file {body_file}: {exc}", file=sys.stderr)
+            return False
+
     if getattr(args, 'body_stdin_base64', False):
         if not sys.stdin.isatty():
             try:
@@ -1300,13 +1422,17 @@ def cmd_reply(args):
     if not _resolve_body(args):
         return 1
     try:
+        _reply_step("opening Outlook session")
         with OutlookSessionManager() as session:
+            _reply_step("loading source email")
             email_item = _get_email_item(session, args.email_id)
+            _reply_step("source email loaded")
             current_user = session.outlook.Session.CurrentUser
             current_user_email = (
                 current_user.AddressEntry.GetExchangeUser().PrimarySmtpAddress
                 if current_user.AddressEntry.GetExchangeUser() else ""
             )
+            _reply_step("current user resolved")
 
             parent_folder = email_item.Parent
             is_sent_items = "Sent Items" in parent_folder.Name or "已发送邮件" in parent_folder.Name
@@ -1314,60 +1440,90 @@ def cmd_reply(args):
             if args.only:
                 # --only: reply to From (sender) only
                 if is_sent_items:
+                    _reply_step("creating new reply item from Sent Items source")
                     reply = session.outlook.CreateItem(0)
+                    _reply_step("adding explicit recipients")
                     _add_recipients(reply, args.to, args.cc)
+                    _reply_step("displaying reply item to load signature")
                     reply.Display(False)
                     signature_html = reply.HTMLBody
                     original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
+                    _reply_step("setting HTML body")
                     reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
                 else:
+                    _reply_step("creating sender-only reply item")
                     reply = email_item.Reply()
+                    _reply_step("adding explicit recipients")
                     _add_recipients(reply, args.to, args.cc)
+                    _reply_step("setting HTML body")
                     reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
             elif is_sent_items:
                 # Sent Items: create new email with original recipients
+                _reply_step("creating new reply-all item from Sent Items source")
                 reply = session.outlook.CreateItem(0)
+                _reply_step("copying original recipients")
                 for i in range(1, email_item.Recipients.Count + 1):
                     recip = email_item.Recipients.Item(i)
                     smtp = _get_smtp_address(recip)
                     if smtp and smtp.lower() != current_user_email.lower():
                         new_recip = reply.Recipients.Add(smtp)
                         new_recip.Type = recip.Type  # 1=To, 2=CC
+                _reply_step("adding explicit recipients")
                 _add_recipients(reply, args.to, args.cc)
+                _reply_step("displaying reply item to load signature")
                 reply.Display(False)
                 signature_html = reply.HTMLBody
                 original_body = email_item.HTMLBody if email_item.HTMLBody else f"<p>{email_item.Body}</p>"
+                _reply_step("setting HTML body")
                 reply.HTMLBody = _wrap_body_font(args.body) + signature_html + _build_reply_header(email_item, current_user_email) + original_body
             else:
                 # Default: ReplyAll
+                _reply_step("creating reply-all item")
                 reply = email_item.ReplyAll()
+                _reply_step("removing current user from recipients")
                 _remove_self_from_recipients(reply, current_user_email)
+                _reply_step("adding explicit recipients")
                 _add_recipients(reply, args.to, args.cc)
+                _reply_step("setting HTML body")
                 reply.HTMLBody = _wrap_body_font(args.body) + reply.HTMLBody
 
+            _reply_step("ensuring UTF-8 charset")
             reply.HTMLBody = _ensure_utf8_charset(reply.HTMLBody)
+            _reply_step("preserving inline images")
             _preserve_inline_images(reply, email_item)
+            _reply_step("setting subject")
             reply.Subject = f"RE: {email_item.Subject}" if not email_item.Subject.startswith("RE:") else email_item.Subject
 
+            _reply_step("checking recipients")
             if reply.Recipients.Count == 0:
                 print("Error: No recipients found.")
                 return 1
 
             count = reply.Recipients.Count
+            _reply_step("adding inline images")
             _add_inline_images(reply, args.inline_image)
+            _reply_step("adding attachments")
             _add_attachments(reply, args.attach)
+            _reply_step("attaching emails")
             _attach_emails(reply, args.attach_email, session)
+            _reply_step("setting importance")
             _set_importance(reply, args.importance)
             subject = reply.Subject
+            sent_before_ids = _collect_recent_sent_entry_ids(session, subject)
+            from datetime import datetime, timezone
+            send_start_time = datetime.now(timezone.utc)
+            _reply_step("sending")
             reply.Send()
+            _reply_step("send returned")
             mode = "Reply (From only)" if args.only else "Reply-all"
             print(f"{mode} sent to {count} recipient(s)")
-            _print_sent_entry_id(session, subject)
+            _reply_step("locating sent EntryID")
+            _print_sent_entry_id(session, subject, sent_after=send_start_time, exclude_entry_ids=sent_before_ids)
+            _reply_step("sent EntryID lookup complete")
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
         return 1
-
 
 def cmd_compose(args):
     """Compose and send new email (always HTML format)"""
@@ -1401,10 +1557,13 @@ def cmd_compose(args):
             _add_attachments(mail, args.attach)
             _attach_emails(mail, args.attach_email, session)
             _set_importance(mail, args.importance)
+            sent_before_ids = _collect_recent_sent_entry_ids(session, args.subject)
+            from datetime import datetime, timezone
+            send_start_time = datetime.now(timezone.utc)
             mail.Send()
             total_recipients = len(to_list) + len(cc_list)
             print(f"HTML email sent successfully to {total_recipients} recipient(s)")
-            _print_sent_entry_id(session, args.subject)
+            _print_sent_entry_id(session, args.subject, sent_after=send_start_time, exclude_entry_ids=sent_before_ids)
 
         return 0
     except Exception as e:
@@ -1414,6 +1573,13 @@ def cmd_compose(args):
 
 def cmd_batch_forward(args):
     """Batch forward email to multiple recipients by email ID"""
+    if getattr(args, 'message_base64', None):
+        try:
+            args.message = base64.b64decode(args.message_base64).decode('utf-8')
+        except Exception as exc:
+            print(f"Error: invalid --body-base64/--message-base64 payload: {exc}", file=sys.stderr)
+            return 1
+
     try:
         # Import batch configuration from backend/config.py
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -1445,6 +1611,8 @@ def cmd_batch_forward(args):
             from datetime import datetime, timezone
             total_sent = 0
             num_batches = (len(recipients) + batch_size - 1) // batch_size
+            fw_subject = f"FW: {email_subject}" if not email_subject.startswith("FW:") else email_subject
+            existing_sent_ids = _collect_recent_sent_entry_ids(session, fw_subject)
             send_start_time = datetime.now(timezone.utc)
 
             for i in range(0, len(recipients), batch_size):
@@ -1475,10 +1643,8 @@ def cmd_batch_forward(args):
             print(f"Successfully forwarded email: {email_subject}")
 
             # Retrieve EntryIDs for all sent batches
-            fw_subject = f"FW: {email_subject}" if not email_subject.startswith("FW:") else email_subject
-            import re
-            bare_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', fw_subject or '', flags=re.IGNORECASE)
-            threshold = send_start_time
+            bare_subject = _bare_subject(fw_subject)
+            threshold = send_start_time - timedelta(seconds=5)
 
             for attempt in range(15):
                 time.sleep(2)
@@ -1497,9 +1663,13 @@ def cmd_batch_forward(args):
                             sent_utc = sent_on.replace(tzinfo=timezone.utc)
                         if sent_utc < threshold:
                             break
-                        bare_item_subject = re.sub(r'^(RE:\s*|FW:\s*)+', '', item.Subject or '', flags=re.IGNORECASE)
-                        if bare_subject in bare_item_subject:
-                            found_ids.append(item.EntryID)
+                        bare_item_subject = _bare_subject(getattr(item, 'Subject', ''))
+                        entry_id = getattr(item, 'EntryID', None)
+                        if entry_id in existing_sent_ids:
+                            item = items.GetNext()
+                            continue
+                        if bare_subject in bare_item_subject and entry_id:
+                            found_ids.append(entry_id)
                         item = items.GetNext()
                     if len(found_ids) >= num_batches:
                         for idx, eid in enumerate(reversed(found_ids), 1):
@@ -1527,6 +1697,11 @@ def cmd_forward(args):
             # Meeting items preserve original attendees as recipients — clear them
             while forward.Recipients.Count > 0:
                 forward.Recipients.Remove(1)
+
+            # Remove attachments if requested
+            if getattr(args, 'no_attachments', False):
+                while forward.Attachments.Count > 0:
+                    forward.Attachments.Remove(1)
 
             # Set subject: use --subject override or default FW: prefix
             original_subject = str(getattr(email_item, "Subject", "No Subject"))
@@ -1578,10 +1753,13 @@ def cmd_forward(args):
             _add_attachments(forward, args.attach)
             _attach_emails(forward, args.attach_email, session)
             _set_importance(forward, args.importance)
+            sent_before_ids = _collect_recent_sent_entry_ids(session, final_subject)
+            from datetime import datetime, timezone
+            send_start_time = datetime.now(timezone.utc)
             forward.Send()
             print(f"Forward sent to {recipient_count} recipient(s)")
             print(f"Subject: {final_subject}")
-            _print_sent_entry_id(session, final_subject)
+            _print_sent_entry_id(session, final_subject, sent_after=send_start_time, exclude_entry_ids=sent_before_ids)
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -1622,10 +1800,13 @@ def cmd_redirect(args):
 
             _add_inline_images(forward, args.inline_image)
             _add_attachments(forward, args.attach)
+            sent_before_ids = _collect_recent_sent_entry_ids(session, final_subject)
+            from datetime import datetime, timezone
+            send_start_time = datetime.now(timezone.utc)
             forward.Send()
             print(f"Redirected to {recipient_count} recipient(s)")
             print(f"Subject: {final_subject}")
-            _print_sent_entry_id(session, final_subject)
+            _print_sent_entry_id(session, final_subject, sent_after=send_start_time, exclude_entry_ids=sent_before_ids)
             return 0
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -2761,9 +2942,11 @@ def main():
     parser_reply = subparsers.add_parser('reply', help='Reply to email (default: reply-all; --only: From only)')
     parser_reply.add_argument('email_id', help='Email ID from search results')
     parser_reply.add_argument('body', nargs='?', default=None, help='Reply text in HTML format')
+    parser_reply.add_argument('--body', dest='body', help='Reply text in HTML format')
     parser_reply.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_reply.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
     parser_reply.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
+    parser_reply.add_argument('--body-file', help='Path to file containing the HTML body')
     parser_reply.add_argument('--to', help='Additional To recipients (comma separated)')
     parser_reply.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_reply.add_argument('--attach', help='File path(s) to attach (comma separated)')
@@ -2781,6 +2964,7 @@ def main():
     parser_compose.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_compose.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
     parser_compose.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
+    parser_compose.add_argument('--body-file', help='Path to file containing the HTML body')
     parser_compose.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_compose.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_compose.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
@@ -2797,11 +2981,13 @@ def main():
     parser_forward.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_forward.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
     parser_forward.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
+    parser_forward.add_argument('--body-file', help='Path to file containing the HTML body')
     parser_forward.add_argument('--attach', help='File path(s) to attach (comma separated)')
     parser_forward.add_argument('--attach-email', help='Email ID(s) to attach as .msg (comma separated)')
     parser_forward.add_argument('--inline-image', help='Image path(s) to embed inline in body (comma separated)')
     parser_forward.add_argument('--importance', choices=['high', 'low'], help='Set email importance (high or low)')
     parser_forward.add_argument('--subject', help='Override the forwarded subject (default: FW: <original>)')
+    parser_forward.add_argument('--no-attachments', action='store_true', help='Remove any attachments from the forwarded email')
     parser_forward.set_defaults(func=cmd_forward)
 
     # Redirect command (clear all recipients, add new ones)
@@ -2811,6 +2997,7 @@ def main():
     parser_redirect.add_argument('--body-stdin', action='store_true', help='Read body from stdin pipe')
     parser_redirect.add_argument('--body-stdin-base64', action='store_true', help='Read base64-encoded UTF-8 HTML body from stdin')
     parser_redirect.add_argument('--body-base64', help='Base64 encoded UTF-8 HTML body')
+    parser_redirect.add_argument('--body-file', help='Path to file containing the HTML body')
     parser_redirect.add_argument('--to', required=True, help='To recipients (comma separated)')
     parser_redirect.add_argument('--cc', action='append', help='CC recipients (comma separated or repeated)')
     parser_redirect.add_argument('--attach', help='File path(s) to attach (comma separated)')
@@ -2822,6 +3009,8 @@ def main():
     parser_batch.add_argument('email_id', help='Email ID from search results')
     parser_batch.add_argument('csv_path', help='Path to CSV file with email addresses')
     parser_batch.add_argument('--message', help='Custom message to prepend (HTML format)')
+    parser_batch.add_argument('--body-base64', dest='message_base64', help='Base64 encoded UTF-8 custom message to prepend (HTML format)')
+    parser_batch.add_argument('--message-base64', dest='message_base64', help='Alias for --body-base64')
     parser_batch.set_defaults(func=cmd_batch_forward)
     
     # Create folder command
