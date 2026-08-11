@@ -548,6 +548,10 @@ def cmd_search(args):
         # Single-field search (most common case)
         if len(field_searches) == 1:
             search_type, query = field_searches[0]
+            # Auto-route '@' queries in subject/query to sender search
+            if '@' in query and search_type == 'subject' and not getattr(args, 'subject', None):
+                search_type = 'sender'
+
             emails, note = unified_search(
                 search_term=query,
                 days=effective_days,
@@ -556,6 +560,21 @@ def cmd_search(args):
                 match_all=args.match_all,
                 search_type=search_type,
             )
+
+            # Auto-fallback for email address searches: if no results found in default window,
+            # auto-expand search window to 90 days to find historical emails from that address.
+            if not emails and '@' in query and search_type in ('sender', 'recipient') and args.days == search_config.DIRECT_FIND_DEFAULT_DAYS:
+                expanded_days = 90
+                emails, note = unified_search(
+                    search_term=query,
+                    days=expanded_days,
+                    folder_name=args.folder,
+                    folder_names=folder_names,
+                    match_all=args.match_all,
+                    search_type=search_type,
+                )
+                if emails:
+                    note += f" (auto-expanded search window to {expanded_days} days for email address match)"
         else:
             # Multi-field: run each search, intersect by email ID
             result_sets = []
@@ -620,6 +639,8 @@ def cmd_get_email(args):
             fields = set(f.strip().lower() for f in args.fields.split(','))
 
         truncate_len = getattr(args, 'truncate', None)
+        latest_only = getattr(args, 'latest_only', False)
+        max_lines = getattr(args, 'max_lines', None)
 
         with OutlookSessionManager() as session:
             for idx, email_id in enumerate(email_ids):
@@ -805,6 +826,21 @@ def cmd_get_email(args):
                             pass
                 if not fields or 'body' in fields:
                     body = getattr(email_item, 'Body', '') or ''
+                    if latest_only:
+                        delimiters = [
+                            r'\r?\n_{5,}',
+                            r'\r?\n-----Original Message-----',
+                            r'\r?\nFrom:\s+[^\r\n]+\r?\nSent:',
+                            r'\r?\nFrom:\s+[^\r\n]+\r?\nDate:',
+                        ]
+                        pattern = '|'.join(delimiters)
+                        parts = re.split(pattern, body, maxsplit=1, flags=re.IGNORECASE)
+                        if parts:
+                            body = parts[0].rstrip()
+                    if max_lines is not None:
+                        lines = body.splitlines()
+                        if len(lines) > max_lines:
+                            body = '\n'.join(lines[:max_lines]) + f"\n\n... [TRUNCATED to {max_lines} lines]"
                     if truncate_len is not None and len(body) > truncate_len:
                         truncated_body = body[:truncate_len] + f"\n\n... [TRUNCATED to {truncate_len} chars]"
                     else:
@@ -2936,6 +2972,8 @@ def main():
     parser_get_email.add_argument('--id', dest='email_id_flag', help='Email ID (alternative to positional)')
     parser_get_email.add_argument('--fields', help='Comma-separated fields to show (from,to,cc,subject,date,body)')
     parser_get_email.add_argument('--truncate', type=int, default=None, help='Truncate the email body to N characters')
+    parser_get_email.add_argument('--latest-only', '-l', action='store_true', help='Show only the latest message body, excluding quoted thread history')
+    parser_get_email.add_argument('--max-lines', type=int, default=None, help='Show up to N lines of the email body')
     parser_get_email.set_defaults(func=cmd_get_email)
     
     # Reply command (default: reply-all; --only: sender only)
