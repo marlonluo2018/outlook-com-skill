@@ -21,7 +21,7 @@ from .search_common import (
 logger = get_logger(__name__)
 
 
-def list_recent_emails(folder_name: str = "Inbox", days: int = None, limit: int = None) -> Tuple[List[Dict[str, Any]], str]:
+def list_recent_emails(folder_name: str = "Inbox", days: int = None, limit: int = None, lightweight: bool = False) -> Tuple[List[Dict[str, Any]], str]:
     """Public interface for listing emails.
     Returns (emails, message) tuple with emails containing message_id.
     """
@@ -38,14 +38,14 @@ def list_recent_emails(folder_name: str = "Inbox", days: int = None, limit: int 
         raise ValueError(f"Invalid parameters: {e}")
 
     # Load emails from Outlook
-    emails, note = get_emails_from_folder_optimized(folder_name=params.folder_name, days=params.days, limit=limit)
+    emails, note = get_emails_from_folder_optimized(folder_name=params.folder_name, days=params.days, limit=limit, lightweight=lightweight)
     
     days_str = f" from last {params.days} days" if params.days else ""
     
     return emails, f"Found {len(emails)} emails in '{params.folder_name}'{days_str}"
 
 
-def list_recent_emails_multi(folder_names: list = None, days: int = None, limit: int = None) -> Tuple[List[Dict[str, Any]], str]:
+def list_recent_emails_multi(folder_names: list = None, days: int = None, limit: int = None, lightweight: bool = False) -> Tuple[List[Dict[str, Any]], str]:
     """List recent emails from multiple folders (default: Inbox + Sent Items).
     Returns (emails, message) tuple. Each email dict includes 'folder_name'.
     """
@@ -60,7 +60,7 @@ def list_recent_emails_multi(folder_names: list = None, days: int = None, limit:
 
     for fname in folder_names:
         # If we have a limit, we can pass it down as well
-        emails, _ = get_emails_from_folder_optimized(folder_name=fname, days=effective_days, limit=limit)
+        emails, _ = get_emails_from_folder_optimized(folder_name=fname, days=effective_days, limit=limit, lightweight=lightweight)
         for email in emails:
             eid = email.get("entry_id", "")
             if eid and eid not in seen_ids:
@@ -77,7 +77,7 @@ def list_recent_emails_multi(folder_names: list = None, days: int = None, limit:
     return all_emails, f"Found {len(all_emails)} emails in '{folder_label}' from last {effective_days} days"
 
 
-def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7, limit: int = None) -> Tuple[List[Dict[str, Any]], str]:
+def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7, limit: int = None, lightweight: bool = False) -> Tuple[List[Dict[str, Any]], str]:
     """
     Optimized version of get_emails_from_folder with performance improvements.
     
@@ -247,8 +247,8 @@ def get_emails_from_folder_optimized(folder_name: str = "Inbox", days: int = 7, 
             
             # MAJOR OPTIMIZATION: Use parallel extraction for list operations
             from .parallel_extractor import extract_emails_optimized
-            
-            email_list = extract_emails_optimized(filtered_items, use_parallel=True, max_workers=4)
+
+            email_list = extract_emails_optimized(filtered_items, use_parallel=True, max_workers=4, lightweight=lightweight)
             
             if not email_list:
                 return [], f"No valid emails found in '{params.folder_name}' from last {params.days} days"

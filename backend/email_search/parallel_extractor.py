@@ -20,17 +20,74 @@ _MAPI_START_PROP = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C00
 _MAPI_END_PROP = 'http://schemas.microsoft.com/mapi/id/{00062002-0000-0000-C000-000000000046}/820E0040'
 
 
+_MAPI_SENDER_SMTP = 'http://schemas.microsoft.com/mapi/proptag/0x5D01001F'
+
+_self_email = None
+_self_ex_address = None
+_self_lock = threading.Lock()
+
+
+def _resolve_self_email():
+    """Return (self_email, self_ex_address), lazily resolved and cached once.
+
+    Used to map the sender of our own Sent Items (whose /o= EX path carries
+    no usable SMTP address on the message itself) back to a readable address.
+    """
+    global _self_email, _self_ex_address
+    if _self_email is not None:
+        return _self_email, _self_ex_address
+    with _self_lock:
+        if _self_email is None:
+            email, ex_addr = "", ""
+            try:
+                import win32com.client
+                outlook = win32com.client.GetActiveObject("Outlook.Application")
+                current_user = outlook.Session.CurrentUser
+                ae = current_user.AddressEntry
+                try:
+                    eu = ae.GetExchangeUser()
+                    if eu:
+                        email = eu.PrimarySmtpAddress or ""
+                except Exception:
+                    email = ""
+                try:
+                    ex_addr = ae.Address or ""
+                except Exception:
+                    ex_addr = ""
+            except Exception:
+                pass
+            _self_email, _self_ex_address = email, ex_addr
+    return _self_email, _self_ex_address
+
+
 def _get_sender_smtp(item) -> str:
     """Helper to safely extract the sender's SMTP address."""
     try:
         email_type = getattr(item, 'SenderEmailType', '')
         email_address = getattr(item, 'SenderEmailAddress', '')
-        if email_type == "EX":
+        if email_type == "EX" or (email_address or '').lower().startswith('/o='):
+            # 1) Prefer AddressEntry / GAL resolution
             sender = getattr(item, 'Sender', None)
             if sender:
-                user = sender.GetExchangeUser()
-                if user and user.PrimarySmtpAddress:
-                    return user.PrimarySmtpAddress
+                try:
+                    user = sender.GetExchangeUser()
+                    if user and user.PrimarySmtpAddress:
+                        return user.PrimarySmtpAddress
+                except Exception:
+                    pass
+            # 2) MAPI PR_SENDER_SMTP_ADDRESS: works even when Sender is None
+            #    (e.g. received meeting invites), no GAL lookup required.
+            try:
+                smtp = item.PropertyAccessor.GetProperty(_MAPI_SENDER_SMTP)
+                if smtp:
+                    return smtp
+            except Exception:
+                pass
+            # 3) Sent by self: match the EX path to the current user
+            self_email, self_ex = _resolve_self_email()
+            if self_email and self_ex:
+                if (email_address or '').replace(' ', '').lower() == self_ex.replace(' ', '').lower():
+                    return self_email
         return email_address or ""
     except Exception:
         try:
@@ -493,21 +550,129 @@ def extract_emails_sequential_fallback(items: List[Any]) -> List[Dict[str, Any]]
     
     return email_list
 
-def extract_emails_optimized(items: List[Any], use_parallel: bool = True, max_workers: int = 4) -> List[Dict[str, Any]]:
+def extract_emails_lightweight(items: List[Any]) -> List[Dict[str, Any]]:
+    """Fast, single-threaded extraction for bulk/sync listing.
+
+    Deliberately skips the expensive per-item operations that are only needed
+    for interactive display:
+      - No GetExchangeUser() SMTP resolution for EX senders/recipients (GAL
+        lookups are very slow on Sent Items and routinely blow past command
+        timeouts).
+      - No per-attachment Content-ID PropertyAccessor probes.
+    Output schema matches the other extractors so downstream serialization
+    (find-recent --json / run_email_sync.py) works unchanged.
+    """
+    email_list = []
+    for item in items:
+        try:
+            entry_id = getattr(item, 'EntryID', '') or ''
+            if not entry_id:
+                continue
+
+            subject = getattr(item, 'Subject', '') or 'No Subject'
+            sender = getattr(item, 'SenderName', '') or 'Unknown'
+            sender_email = getattr(item, 'SenderEmailAddress', '') or ''
+            received = getattr(item, 'ReceivedTime', None)
+
+            message_class = getattr(item, 'MessageClass', '') or ''
+            meeting_status_raw = getattr(item, 'MeetingStatus', 0) or 0
+
+            to_recipients, cc_recipients = [], []
+            try:
+                recipients = getattr(item, 'Recipients', None)
+                if recipients:
+                    for recipient in recipients:
+                        try:
+                            rec_type = getattr(recipient, 'Type', 1)
+                            name = getattr(recipient, 'Name', '') or ''
+                            address = getattr(recipient, 'Address', '') or ''
+                            if address.startswith('/o='):
+                                address = ''
+                            info = {"name": name, "address": address}
+                            if rec_type == 1:
+                                to_recipients.append(info)
+                            elif rec_type == 2:
+                                cc_recipients.append(info)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            start_str, end_str = "", ""
+            try:
+                if 'Schedule' in message_class or meeting_status_raw:
+                    pa = item.PropertyAccessor
+                    start_val = pa.GetProperty(_MAPI_START_PROP)
+                    end_val = pa.GetProperty(_MAPI_END_PROP)
+                    if start_val:
+                        start_str = str(start_val.replace(tzinfo=None))
+                    if end_val:
+                        end_str = str(end_val.replace(tzinfo=None))
+            except Exception:
+                pass
+
+            attachments_count = 0
+            has_attachments = False
+            try:
+                atts = getattr(item, 'Attachments', None)
+                if atts:
+                    attachments_count = atts.Count
+                    has_attachments = attachments_count > 0
+            except Exception:
+                pass
+
+            body_preview = ""
+            try:
+                raw_body = getattr(item, 'Body', '') or ''
+                body_preview = raw_body[:200].strip()
+            except Exception:
+                pass
+
+            email_list.append({
+                "entry_id": entry_id,
+                "subject": subject,
+                "sender": sender,
+                "sender_email": sender_email,
+                "received_time": str(received.replace(tzinfo=None)) if received else "Unknown",
+                "start_time": start_str,
+                "end_time": end_str,
+                "to_recipients": to_recipients,
+                "cc_recipients": cc_recipients,
+                "has_attachments": has_attachments,
+                "attachments": [],
+                "attachments_count": attachments_count,
+                "embedded_images_count": 0,
+                "embedded_images": [],
+                "body_preview": body_preview,
+                "unread": getattr(item, 'UnRead', False),
+                "message_class": message_class,
+                "meeting_status": _meeting_status_label(meeting_status_raw),
+            })
+        except Exception:
+            continue
+    return email_list
+
+
+def extract_emails_optimized(items: List[Any], use_parallel: bool = True, max_workers: int = 4, lightweight: bool = False) -> List[Dict[str, Any]]:
     """
     Optimized email extraction with automatic fallback and improved small dataset handling.
-    
+
     Args:
         items: List of Outlook MailItem objects
         use_parallel: Whether to use parallel processing
         max_workers: Maximum number of worker threads (if parallel)
-        
+        lightweight: When True, use the fast single-threaded extractor that
+            skips expensive SMTP/attachment resolution (for bulk sync listing).
+
     Returns:
         List of email dictionaries
     """
     if not items:
         return []
-    
+
+    if lightweight:
+        return extract_emails_lightweight(items)
+
     item_count = len(items)
     
     # Optimized thresholds for better performance

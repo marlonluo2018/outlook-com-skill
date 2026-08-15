@@ -86,10 +86,14 @@ def _outlook_cli_lock(timeout_seconds: int = OUTLOOK_LOCK_TIMEOUT_SECONDS):
 
     lock_path = os.path.join(tempfile.gettempdir(), "brainclaw_outlook_com.lock")
     with open(lock_path, "a+b") as lock_file:
-        lock_file.seek(0)
-        if not lock_file.read(1):
-            lock_file.write(b"0")
-            lock_file.flush()
+        try:
+            lock_file.seek(0)
+            if not lock_file.read(1):
+                lock_file.write(b"0")
+                lock_file.flush()
+        except OSError:
+            # Another process holds the lock on byte 0; proceed to locking loop below.
+            pass
 
         deadline = time.monotonic() + max(timeout_seconds, 1)
         while True:
@@ -188,9 +192,9 @@ def cmd_list_recent(args):
     """List recent emails with their IDs"""
     try:
         if args.folder:
-            emails, message = list_recent_emails(args.folder, args.days, limit=args.limit)
+            emails, message = list_recent_emails(args.folder, args.days, limit=args.limit, lightweight=getattr(args, 'json', False))
         else:
-            emails, message = list_recent_emails_multi(days=args.days, limit=args.limit)
+            emails, message = list_recent_emails_multi(days=args.days, limit=args.limit, lightweight=getattr(args, 'json', False))
 
         if args.limit and len(emails) > args.limit:
             emails = emails[:args.limit]

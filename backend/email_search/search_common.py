@@ -6,6 +6,7 @@ email search implementations.
 """
 
 # Standard library imports
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -317,17 +318,70 @@ def _get_smtp_address(recipient) -> str:
             return ""
 
 
+_MAPI_SENDER_SMTP = 'http://schemas.microsoft.com/mapi/proptag/0x5D01001F'
+
+_self_email = None
+_self_ex_address = None
+_self_lock = threading.Lock()
+
+
+def _resolve_self_email():
+    """Return (self_email, self_ex_address), lazily resolved and cached once."""
+    global _self_email, _self_ex_address
+    if _self_email is not None:
+        return _self_email, _self_ex_address
+    with _self_lock:
+        if _self_email is None:
+            email, ex_addr = "", ""
+            try:
+                import win32com.client
+                outlook = win32com.client.GetActiveObject("Outlook.Application")
+                current_user = outlook.Session.CurrentUser
+                ae = current_user.AddressEntry
+                try:
+                    eu = ae.GetExchangeUser()
+                    if eu:
+                        email = eu.PrimarySmtpAddress or ""
+                except Exception:
+                    email = ""
+                try:
+                    ex_addr = ae.Address or ""
+                except Exception:
+                    ex_addr = ""
+            except Exception:
+                pass
+            _self_email, _self_ex_address = email, ex_addr
+    return _self_email, _self_ex_address
+
+
 def _get_sender_smtp(item) -> str:
     """Helper to safely extract the sender's SMTP address."""
     try:
         email_type = getattr(item, 'SenderEmailType', '')
         email_address = getattr(item, 'SenderEmailAddress', '')
-        if email_type == "EX":
+        if email_type == "EX" or (email_address or '').lower().startswith('/o='):
+            # 1) Prefer AddressEntry / GAL resolution
             sender = getattr(item, 'Sender', None)
             if sender:
-                user = sender.GetExchangeUser()
-                if user and user.PrimarySmtpAddress:
-                    return user.PrimarySmtpAddress
+                try:
+                    user = sender.GetExchangeUser()
+                    if user and user.PrimarySmtpAddress:
+                        return user.PrimarySmtpAddress
+                except Exception:
+                    pass
+            # 2) MAPI PR_SENDER_SMTP_ADDRESS: works even when Sender is None
+            #    (e.g. received meeting invites), no GAL lookup required.
+            try:
+                smtp = item.PropertyAccessor.GetProperty(_MAPI_SENDER_SMTP)
+                if smtp:
+                    return smtp
+            except Exception:
+                pass
+            # 3) Sent by self: match the EX path to the current user
+            self_email, self_ex = _resolve_self_email()
+            if self_email and self_ex:
+                if (email_address or '').replace(' ', '').lower() == self_ex.replace(' ', '').lower():
+                    return self_email
         return email_address or ""
     except Exception:
         try:
